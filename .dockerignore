@@ -1,0 +1,8 @@
+.env*
+.history/
+.git/
+.gitignore
+.dockerignore
+scripts/
+data/
+*.md
