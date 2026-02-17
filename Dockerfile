@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -20,11 +20,5 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /bot /app/bot
-
-# Create data directory for persistent storage
-RUN mkdir -p /app/data
-
-# Default data directory (mount a volume here for persistence)
-ENV DATA_DIR=/app/data
 
 ENTRYPOINT ["/app/bot"]

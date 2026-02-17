@@ -91,59 +91,100 @@ DISCLAIMER: This bot is for informational and educational purposes only. Nothing
 }
 
 // handleAdd validates and adds a stock symbol to the user's watchlist.
+// If no symbol is provided (e.g. user clicked /add in menu), prompts them to reply with one.
 func (b *Bot) handleAdd(msg *tgbotapi.Message) {
 	symbol := strings.TrimSpace(msg.CommandArguments())
 	if symbol == "" {
-		b.sendText(msg.Chat.ID, "Usage: /add SYMBOL\nExample: /add AAPL")
+		b.pendingMu.Lock()
+		b.pendingAction[msg.Chat.ID] = pendingAdd
+		b.pendingMu.Unlock()
+		b.sendText(msg.Chat.ID, "Which stock would you like to add? Reply with the ticker (e.g. AAPL, MSFT, 005930.KS).")
 		return
 	}
-	symbol = strings.ToUpper(symbol)
+	b.doAdd(msg.Chat.ID, symbol)
+}
 
-	// Check for duplicate and watchlist limit (fast, no network call)
-	existing := b.Store.GetSymbols(msg.Chat.ID)
+// doAdd performs the add-symbol logic (used by handleAdd and handlePendingSymbol).
+func (b *Bot) doAdd(chatID int64, symbol string) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+
+	existing := b.Store.GetSymbols(chatID)
 	if len(existing) >= 10 {
-		b.sendText(msg.Chat.ID, "You've reached the 10 stock limit. Please pay 5 dolla to 83055237 to unlock more slots.")
+		b.sendText(chatID, "You've reached the 10 stock limit. Please pay 5 dolla to 83055237 to unlock more slots.")
 		return
 	}
 	for _, s := range existing {
 		if s == symbol {
-			b.sendText(msg.Chat.ID, fmt.Sprintf("%s is already in your watchlist.", symbol))
+			b.sendText(chatID, fmt.Sprintf("%s is already in your watchlist.", symbol))
 			return
 		}
 	}
 
-	// Validate symbol with Yahoo Finance
-	b.sendText(msg.Chat.ID, fmt.Sprintf("Checking %s...", symbol))
+	b.sendText(chatID, fmt.Sprintf("Checking %s...", symbol))
 
 	if err := yahoo.ValidateSymbol(symbol); err != nil {
-		b.sendText(msg.Chat.ID, fmt.Sprintf("Symbol %s not found. Please check the ticker and try again.", symbol))
+		b.sendText(chatID, fmt.Sprintf("Symbol %s not found. Please check the ticker and try again.", symbol))
 		log.Printf("Symbol validation failed for %s: %v", symbol, err)
 		return
 	}
 
-	if err := b.Store.AddSymbol(msg.Chat.ID, symbol); err != nil {
-		b.sendText(msg.Chat.ID, fmt.Sprintf("Could not add %s: %s", symbol, err.Error()))
+	if err := b.Store.AddSymbol(chatID, symbol); err != nil {
+		b.sendText(chatID, fmt.Sprintf("Could not add %s: %s", symbol, err.Error()))
 		return
 	}
 
-	b.sendText(msg.Chat.ID, fmt.Sprintf("Added %s to your watchlist. News will be fetched within the next hour.", symbol))
+	b.sendText(chatID, fmt.Sprintf("Added %s to your watchlist. News will be fetched within the next hour.", symbol))
 }
 
 // handleRemove removes a stock symbol from the user's watchlist.
+// If no symbol is provided (e.g. user clicked /remove in menu), prompts them to reply with one.
 func (b *Bot) handleRemove(msg *tgbotapi.Message) {
 	symbol := strings.TrimSpace(msg.CommandArguments())
 	if symbol == "" {
-		b.sendText(msg.Chat.ID, "Usage: /remove SYMBOL\nExample: /remove AAPL")
+		b.pendingMu.Lock()
+		b.pendingAction[msg.Chat.ID] = pendingRemove
+		b.pendingMu.Unlock()
+		b.sendText(msg.Chat.ID, "Which stock would you like to remove? Reply with the ticker (e.g. AAPL).")
 		return
 	}
-	symbol = strings.ToUpper(symbol)
+	b.doRemove(msg.Chat.ID, symbol)
+}
 
-	if err := b.Store.RemoveSymbol(msg.Chat.ID, symbol); err != nil {
-		b.sendText(msg.Chat.ID, err.Error())
+// doRemove performs the remove-symbol logic (used by handleRemove and handlePendingSymbol).
+func (b *Bot) doRemove(chatID int64, symbol string) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+
+	if err := b.Store.RemoveSymbol(chatID, symbol); err != nil {
+		b.sendText(chatID, err.Error())
 		return
 	}
 
-	b.sendText(msg.Chat.ID, fmt.Sprintf("Removed %s from your watchlist.", symbol))
+	b.sendText(chatID, fmt.Sprintf("Removed %s from your watchlist.", symbol))
+}
+
+// handlePendingSymbol processes a reply after /add, /remove, /news, or /analyse was sent without arguments.
+func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
+	switch action {
+	case pendingAdd:
+		if text == "" {
+			b.sendText(chatID, "Please send a ticker symbol (e.g. AAPL, MSFT).")
+			return
+		}
+		b.doAdd(chatID, text)
+	case pendingRemove:
+		if text == "" {
+			b.sendText(chatID, "Please send a ticker symbol (e.g. AAPL).")
+			return
+		}
+		b.doRemove(chatID, text)
+	case pendingNews:
+		b.doNews(chatID, text)
+	case pendingAnalyse:
+		if userID == 0 {
+			userID = chatID // fallback for rate limit
+		}
+		b.doAnalyse(chatID, userID, text)
+	}
 }
 
 // handleList shows all symbols in the user's watchlist.
@@ -162,25 +203,44 @@ func (b *Bot) handleList(msg *tgbotapi.Message) {
 }
 
 // handleNews returns news articles. Supports:
-//   - /news        -> last 10 cached articles across all watchlist symbols
-//   - /news SYMBOL -> fetch live news for any symbol (doesn't need to be in watchlist)
+//   - /news        -> prompt: symbol or all
+//   - /news SYMBOL -> fetch live news for that symbol
+//   - /news (then reply "all") -> cached news across watchlist
 func (b *Bot) handleNews(msg *tgbotapi.Message) {
 	arg := strings.TrimSpace(msg.CommandArguments())
 
-	// If a specific symbol is given, fetch live — no watchlist needed
-	if arg != "" {
+	// No arg — ask for symbol or all
+	if arg == "" {
+		b.pendingMu.Lock()
+		b.pendingAction[msg.Chat.ID] = pendingNews
+		b.pendingUserID[msg.Chat.ID] = msg.From.ID
+		b.pendingMu.Unlock()
+		b.sendText(msg.Chat.ID, "Which stock? Reply with a symbol (e.g. AAPL) or 'all' for your watchlist.")
+		return
+	}
+
+	// Specific symbol — fetch live
+	b.doNews(msg.Chat.ID, arg)
+}
+
+// doNews fetches news for a symbol (or "all" for watchlist). Used by handleNews and handlePendingSymbol.
+func (b *Bot) doNews(chatID int64, arg string) {
+	arg = strings.TrimSpace(arg)
+	useAll := arg == "" || strings.EqualFold(arg, "all") || strings.EqualFold(arg, "watchlist")
+
+	if !useAll {
 		symbol := strings.ToUpper(arg)
-		b.sendText(msg.Chat.ID, fmt.Sprintf("Fetching news for %s...", symbol))
+		b.sendText(chatID, fmt.Sprintf("Fetching news for %s...", symbol))
 
 		articles, err := yahoo.FetchNews(symbol)
 		if err != nil {
-			b.sendText(msg.Chat.ID, fmt.Sprintf("Could not fetch news for %s. Please check the symbol and try again.", symbol))
+			b.sendText(chatID, fmt.Sprintf("Could not fetch news for %s. Please check the symbol and try again.", symbol))
 			log.Printf("Live news fetch error for %s: %v", symbol, err)
 			return
 		}
 
 		if len(articles) == 0 {
-			b.sendText(msg.Chat.ID, fmt.Sprintf("No recent news found for %s.", symbol))
+			b.sendText(chatID, fmt.Sprintf("No recent news found for %s.", symbol))
 			return
 		}
 
@@ -202,21 +262,21 @@ func (b *Bot) handleNews(msg *tgbotapi.Message) {
 				escapeHTML(meta),
 			)
 		}
-		b.SendHTML(msg.Chat.ID, text)
+		b.SendHTML(chatID, text)
 		return
 	}
 
-	// No argument — show cached news across watchlist
-	symbols := b.Store.GetSymbols(msg.Chat.ID)
+	// "all" — show cached news across watchlist
+	symbols := b.Store.GetSymbols(chatID)
 	if len(symbols) == 0 {
-		b.sendText(msg.Chat.ID, "Your watchlist is empty. Use /add SYMBOL to add stocks, or use /news SYMBOL to look up any stock directly.")
+		b.sendText(chatID, "Your watchlist is empty. Use /add to add stocks, or reply with a symbol to look up any stock.")
 		return
 	}
 
-	articles := b.Store.GetLatestArticles(msg.Chat.ID, "", 10)
+	articles := b.Store.GetLatestArticles(chatID, "", 10)
 
 	if len(articles) == 0 {
-		b.sendText(msg.Chat.ID, "No cached news yet. News is fetched every hour — try again shortly.")
+		b.sendText(chatID, "No cached news yet. News is fetched every hour — try again shortly.")
 		return
 	}
 
@@ -231,7 +291,7 @@ func (b *Bot) handleNews(msg *tgbotapi.Message) {
 		)
 	}
 
-	b.SendHTML(msg.Chat.ID, text)
+	b.SendHTML(chatID, text)
 }
 
 // handleReports shows next earnings dates for all watchlist symbols.
@@ -264,11 +324,12 @@ func (b *Bot) handleReports(msg *tgbotapi.Message) {
 }
 
 // handleAnalyse generates an AI-powered stock analysis. Supports:
-//   - /analyse        -> analyse each stock in the watchlist
+//   - /analyse        -> prompt: symbol or all
 //   - /analyse SYMBOL -> analyse a specific stock
+//   - /analyse (then reply "all") -> analyse all watchlist
 func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
 	// Check daily usage limit
-	allowed, remaining := b.checkAnalyseLimit(msg.From.ID)
+	allowed, _ := b.checkAnalyseLimit(msg.From.ID)
 	if !allowed {
 		b.sendText(msg.Chat.ID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
 		return
@@ -276,22 +337,46 @@ func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
 
 	arg := strings.TrimSpace(msg.CommandArguments())
 
-	var symbols []string
-	if arg != "" {
-		symbols = []string{strings.ToUpper(arg)}
-	} else {
-		symbols = b.Store.GetSymbols(msg.Chat.ID)
-		if len(symbols) == 0 {
-			b.sendText(msg.Chat.ID, "Your watchlist is empty. Use /add SYMBOL to add stocks first.")
-			return
-		}
+	// No arg — ask for symbol or all
+	if arg == "" {
+		b.pendingMu.Lock()
+		b.pendingAction[msg.Chat.ID] = pendingAnalyse
+		b.pendingUserID[msg.Chat.ID] = msg.From.ID
+		b.pendingMu.Unlock()
+		b.sendText(msg.Chat.ID, "Which stock? Reply with a symbol (e.g. AAPL) or 'all' for your watchlist.")
+		return
 	}
 
-	for _, symbol := range symbols {
-		b.sendText(msg.Chat.ID, fmt.Sprintf("Analysing %s... (this may take a moment)", symbol))
+	b.doAnalyse(msg.Chat.ID, msg.From.ID, arg)
+}
+
+// doAnalyse runs analysis for a symbol or "all" watchlist. Used by handleAnalyse and handlePendingSymbol.
+func (b *Bot) doAnalyse(chatID, userID int64, arg string) {
+	arg = strings.TrimSpace(arg)
+	useAll := arg == "" || strings.EqualFold(arg, "all") || strings.EqualFold(arg, "watchlist")
+
+	var symbols []string
+	if useAll {
+		symbols = b.Store.GetSymbols(chatID)
+		if len(symbols) == 0 {
+			b.sendText(chatID, "Your watchlist is empty. Use /add to add stocks first.")
+			return
+		}
+	} else {
+		symbols = []string{strings.ToUpper(arg)}
+	}
+
+	allowed, remaining := b.checkAnalyseLimit(userID)
+	if !allowed {
+		b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+		return
+	}
+
+	for i, symbol := range symbols {
+		b.sendText(chatID, fmt.Sprintf("Analysing %s... (this may take a moment)", symbol))
 
 		// Gather data: cached news, live price, earnings
-		articles := b.Store.GetLatestArticles(msg.Chat.ID, symbol, 15)
+		articles := b.Store.GetLatestArticles(chatID, symbol, 15)
 
 		quote, err := yahoo.FetchQuote(symbol)
 		if err != nil {
@@ -307,15 +392,18 @@ func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
 
 		result, err := b.Analyser.Analyse(symbol, articles, quote, earnings)
 		if err != nil {
-			b.sendText(msg.Chat.ID, fmt.Sprintf("Could not generate analysis for %s: %v", symbol, err))
+			b.sendText(chatID, fmt.Sprintf("Could not generate analysis for %s: %v", symbol, err))
 			log.Printf("Analysis error for %s: %v", symbol, err)
 			continue
 		}
 
 		// Send as plain text (the AI is instructed not to use markup)
 		header := fmt.Sprintf("=== Analysis: %s ===\n\n", symbol)
-		footer := fmt.Sprintf("\n\n(%d/%d analyses remaining today)", remaining, maxAnalysePerDay)
-		b.sendText(msg.Chat.ID, header+result+footer)
+		footer := ""
+		if i == len(symbols)-1 {
+			footer = fmt.Sprintf("\n\n(%d analyses remaining today)", remaining)
+		}
+		b.sendText(chatID, header+result+footer)
 	}
 }
 

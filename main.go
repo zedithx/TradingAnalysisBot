@@ -21,12 +21,13 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize storage
-	store, err := storage.New(cfg.DataDir)
+	// Initialize storage (Supabase Postgres)
+	store, err := storage.New(cfg.SupabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
-	log.Printf("Storage loaded from %s", cfg.DataDir)
+	defer store.Close()
+	log.Println("Connected to Supabase database")
 
 	// Initialize AI analyser
 	analyser := analysis.New(cfg.OpenAIAPIKey)

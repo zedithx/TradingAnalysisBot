@@ -1,14 +1,15 @@
 package storage
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"log"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CachedArticle is a news article stored by the background fetcher.
@@ -25,141 +26,180 @@ type UserData struct {
 	ChatID   int64                      `json:"chat_id"`
 	Symbols  []string                   `json:"symbols"`
 	AddedAt  time.Time                  `json:"added_at"`
-	Articles map[string][]CachedArticle `json:"articles"` // symbol -> cached articles
+	Articles map[string][]CachedArticle `json:"articles"`
 }
 
-// Store is a concurrency-safe, JSON-file-backed storage for all users.
+// Store provides Supabase/Postgres-backed storage for all users.
 type Store struct {
-	mu       sync.RWMutex
-	filePath string
-	Users    map[string]*UserData `json:"users"` // chatID (string) -> UserData
+	pool *pgxpool.Pool
 }
 
-// New creates or loads a Store from the given data directory.
-func New(dataDir string) (*Store, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create data dir: %w", err)
+// New connects to the Supabase Postgres database and returns a Store.
+func New(databaseURL string) (*Store, error) {
+	if databaseURL == "" {
+		return nil, fmt.Errorf("database URL is required")
 	}
 
-	fp := filepath.Join(dataDir, "users.json")
-	s := &Store{
-		filePath: fp,
-		Users:    make(map[string]*UserData),
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-	// Load existing data if the file exists
-	data, err := os.ReadFile(fp)
-	if err == nil && len(data) > 0 {
-		if err := json.Unmarshal(data, &s.Users); err != nil {
-			return nil, fmt.Errorf("parse users.json: %w", err)
-		}
-	}
-
-	return s, nil
-}
-
-// save writes the current state to disk. Must be called with mu held.
-func (s *Store) save() error {
-	data, err := json.MarshalIndent(s.Users, "", "  ")
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		return fmt.Errorf("marshal users: %w", err)
+		return nil, fmt.Errorf("connect to database: %w", err)
 	}
-	if err := os.WriteFile(s.filePath, data, 0o644); err != nil {
-		return fmt.Errorf("write users.json: %w", err)
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
 	}
-	return nil
+
+	return &Store{pool: pool}, nil
 }
 
-// getOrCreateUser returns the UserData for the given chat ID, creating it if needed.
-// Must be called with mu held for writing.
-func (s *Store) getOrCreateUser(chatID int64) *UserData {
-	key := fmt.Sprintf("%d", chatID)
-	u, ok := s.Users[key]
-	if !ok {
-		u = &UserData{
-			ChatID:   chatID,
-			Symbols:  []string{},
-			AddedAt:  time.Now().UTC(),
-			Articles: make(map[string][]CachedArticle),
-		}
-		s.Users[key] = u
-	}
-	if u.Articles == nil {
-		u.Articles = make(map[string][]CachedArticle)
-	}
-	return u
+// Close releases the connection pool.
+func (s *Store) Close() {
+	s.pool.Close()
+}
+
+// ensureUser creates a user row if it doesn't already exist.
+func (s *Store) ensureUser(ctx context.Context, chatID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+		chatID,
+	)
+	return err
 }
 
 // AddSymbol adds a stock symbol to the user's watchlist.
 // Returns an error if the symbol is already present.
 func (s *Store) AddSymbol(chatID int64, symbol string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	ctx := context.Background()
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	u := s.getOrCreateUser(chatID)
 
-	for _, sym := range u.Symbols {
-		if sym == symbol {
-			return fmt.Errorf("%s is already in your watchlist", symbol)
-		}
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return fmt.Errorf("ensure user: %w", err)
 	}
 
-	u.Symbols = append(u.Symbols, symbol)
-	return s.save()
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO symbols (chat_id, symbol) VALUES ($1, $2)`,
+		chatID, symbol,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
+			return fmt.Errorf("%s is already in your watchlist", symbol)
+		}
+		return fmt.Errorf("add symbol: %w", err)
+	}
+
+	return nil
 }
 
 // RemoveSymbol removes a stock symbol from the user's watchlist.
 func (s *Store) RemoveSymbol(chatID int64, symbol string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	ctx := context.Background()
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	u := s.getOrCreateUser(chatID)
 
-	found := false
-	filtered := make([]string, 0, len(u.Symbols))
-	for _, sym := range u.Symbols {
-		if sym == symbol {
-			found = true
-			continue
-		}
-		filtered = append(filtered, sym)
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM symbols WHERE chat_id = $1 AND symbol = $2`,
+		chatID, symbol,
+	)
+	if err != nil {
+		return fmt.Errorf("remove symbol: %w", err)
 	}
-
-	if !found {
+	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%s is not in your watchlist", symbol)
 	}
 
-	u.Symbols = filtered
-	delete(u.Articles, symbol)
-	return s.save()
+	// Also remove cached articles for this symbol
+	_, _ = s.pool.Exec(ctx,
+		`DELETE FROM articles WHERE chat_id = $1 AND symbol = $2`,
+		chatID, symbol,
+	)
+
+	return nil
 }
 
 // GetSymbols returns the user's current watchlist.
 func (s *Store) GetSymbols(chatID int64) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	ctx := context.Background()
 
-	key := fmt.Sprintf("%d", chatID)
-	u, ok := s.Users[key]
-	if !ok {
+	rows, err := s.pool.Query(ctx,
+		`SELECT symbol FROM symbols WHERE chat_id = $1 ORDER BY id ASC`,
+		chatID,
+	)
+	if err != nil {
+		log.Printf("GetSymbols error: %v", err)
 		return nil
 	}
-	result := make([]string, len(u.Symbols))
-	copy(result, u.Symbols)
+	defer rows.Close()
+
+	var result []string
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			log.Printf("GetSymbols scan error: %v", err)
+			return nil
+		}
+		result = append(result, sym)
+	}
+
 	return result
 }
 
 // GetAllUsers returns all user data (used by the background fetcher).
 func (s *Store) GetAllUsers() map[string]*UserData {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	ctx := context.Background()
 
-	result := make(map[string]*UserData, len(s.Users))
-	for k, v := range s.Users {
-		result[k] = v
+	// Fetch all users
+	userRows, err := s.pool.Query(ctx,
+		`SELECT chat_id, added_at FROM users`,
+	)
+	if err != nil {
+		log.Printf("GetAllUsers error: %v", err)
+		return nil
 	}
+	defer userRows.Close()
+
+	result := make(map[string]*UserData)
+	for userRows.Next() {
+		var chatID int64
+		var addedAt time.Time
+		if err := userRows.Scan(&chatID, &addedAt); err != nil {
+			log.Printf("GetAllUsers scan error: %v", err)
+			return nil
+		}
+		key := fmt.Sprintf("%d", chatID)
+		result[key] = &UserData{
+			ChatID:   chatID,
+			Symbols:  []string{},
+			AddedAt:  addedAt,
+			Articles: make(map[string][]CachedArticle),
+		}
+	}
+
+	// Fetch all symbols and attach to their users
+	symRows, err := s.pool.Query(ctx,
+		`SELECT chat_id, symbol FROM symbols ORDER BY id ASC`,
+	)
+	if err != nil {
+		log.Printf("GetAllUsers symbols error: %v", err)
+		return result
+	}
+	defer symRows.Close()
+
+	for symRows.Next() {
+		var chatID int64
+		var symbol string
+		if err := symRows.Scan(&chatID, &symbol); err != nil {
+			log.Printf("GetAllUsers symbols scan error: %v", err)
+			continue
+		}
+		key := fmt.Sprintf("%d", chatID)
+		if ud, ok := result[key]; ok {
+			ud.Symbols = append(ud.Symbols, symbol)
+		}
+	}
+
 	return result
 }
 
@@ -167,106 +207,158 @@ func (s *Store) GetAllUsers() map[string]*UserData {
 // Keeps at most 50 articles per symbol (most recent), auto-pruning older ones.
 // Returns the slice of newly added (non-duplicate) articles.
 func (s *Store) AddArticles(chatID int64, symbol string, articles []CachedArticle) ([]CachedArticle, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	ctx := context.Background()
 
-	u := s.getOrCreateUser(chatID)
-
-	// Build a set of existing links for fast dedup
-	existing := make(map[string]bool, len(u.Articles[symbol]))
-	for _, a := range u.Articles[symbol] {
-		existing[a.Link] = true
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return nil, fmt.Errorf("ensure user: %w", err)
 	}
 
+	// Get existing links for deduplication
+	rows, err := s.pool.Query(ctx,
+		`SELECT link FROM articles WHERE chat_id = $1 AND symbol = $2`,
+		chatID, symbol,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get existing links: %w", err)
+	}
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var link string
+		if err := rows.Scan(&link); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan link: %w", err)
+		}
+		existing[link] = true
+	}
+	rows.Close()
+
+	// Filter out duplicates
 	var added []CachedArticle
 	for _, a := range articles {
 		if existing[a.Link] {
 			continue
 		}
-		u.Articles[symbol] = append(u.Articles[symbol], a)
 		existing[a.Link] = true
 		added = append(added, a)
 	}
 
-	// Sort by published date descending (newest first)
-	sort.Slice(u.Articles[symbol], func(i, j int) bool {
-		return u.Articles[symbol][i].Published.After(u.Articles[symbol][j].Published)
-	})
+	// Batch insert new articles
+	if len(added) > 0 {
+		batch := &pgx.Batch{}
+		for _, a := range added {
+			batch.Queue(
+				`INSERT INTO articles (chat_id, symbol, title, link, published, fetched_at)
+				 VALUES ($1, $2, $3, $4, $5, $6)
+				 ON CONFLICT (chat_id, symbol, link) DO NOTHING`,
+				chatID, symbol, a.Title, a.Link, a.Published, a.FetchedAt,
+			)
+		}
 
-	// Keep at most 50 per symbol
-	if len(u.Articles[symbol]) > 50 {
-		u.Articles[symbol] = u.Articles[symbol][:50]
+		br := s.pool.SendBatch(ctx, batch)
+		for range added {
+			if _, err := br.Exec(); err != nil {
+				log.Printf("AddArticles insert error: %v", err)
+			}
+		}
+		br.Close()
 	}
 
-	return added, s.save()
+	// Prune to keep at most 50 per symbol (delete oldest beyond 50)
+	_, _ = s.pool.Exec(ctx,
+		`DELETE FROM articles WHERE id IN (
+			SELECT id FROM articles
+			WHERE chat_id = $1 AND symbol = $2
+			ORDER BY published DESC
+			OFFSET 50
+		)`,
+		chatID, symbol,
+	)
+
+	return added, nil
 }
 
 // GetLatestArticles returns the N most recent cached articles for a user.
 // If symbol is empty, returns articles across all watchlist symbols.
-// Results are sorted newest-first.
+// Results are sorted newest-first and deduplicated by link.
 func (s *Store) GetLatestArticles(chatID int64, symbol string, limit int) []CachedArticle {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	ctx := context.Background()
 
-	key := fmt.Sprintf("%d", chatID)
-	u, ok := s.Users[key]
-	if !ok {
-		return nil
+	var rows pgx.Rows
+	var err error
+
+	// Fetch extra rows to account for deduplication across symbols
+	queryLimit := limit * 3
+	if queryLimit < 30 {
+		queryLimit = 30
 	}
-
-	var all []CachedArticle
 
 	if symbol != "" {
-		// Single symbol
-		all = append(all, u.Articles[symbol]...)
+		rows, err = s.pool.Query(ctx,
+			`SELECT symbol, title, link, published, fetched_at
+			 FROM articles
+			 WHERE chat_id = $1 AND symbol = $2
+			 ORDER BY published DESC
+			 LIMIT $3`,
+			chatID, symbol, queryLimit,
+		)
 	} else {
-		// All symbols
-		for _, articles := range u.Articles {
-			all = append(all, articles...)
-		}
+		rows, err = s.pool.Query(ctx,
+			`SELECT symbol, title, link, published, fetched_at
+			 FROM articles
+			 WHERE chat_id = $1
+			 ORDER BY published DESC
+			 LIMIT $2`,
+			chatID, queryLimit,
+		)
 	}
 
-	// Sort newest first
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].Published.After(all[j].Published)
-	})
+	if err != nil {
+		log.Printf("GetLatestArticles error: %v", err)
+		return nil
+	}
+	defer rows.Close()
 
-	// Deduplicate by link (in case the same article appears under multiple symbols)
+	// Collect and deduplicate by link
 	seen := make(map[string]bool)
-	deduped := make([]CachedArticle, 0, len(all))
-	for _, a := range all {
+	var result []CachedArticle
+	for rows.Next() {
+		var a CachedArticle
+		if err := rows.Scan(&a.Symbol, &a.Title, &a.Link, &a.Published, &a.FetchedAt); err != nil {
+			log.Printf("GetLatestArticles scan error: %v", err)
+			return nil
+		}
 		if seen[a.Link] {
 			continue
 		}
 		seen[a.Link] = true
-		deduped = append(deduped, a)
+		result = append(result, a)
 	}
 
-	if limit > 0 && len(deduped) > limit {
-		deduped = deduped[:limit]
+	// Sort newest first (should already be sorted, but ensure after dedup)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Published.After(result[j].Published)
+	})
+
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
 	}
 
-	return deduped
+	return result
 }
 
 // PruneOldArticles removes cached articles older than 7 days for all users.
 func (s *Store) PruneOldArticles() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	ctx := context.Background()
 	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
 
-	for _, u := range s.Users {
-		for sym, articles := range u.Articles {
-			filtered := make([]CachedArticle, 0, len(articles))
-			for _, a := range articles {
-				if a.Published.After(cutoff) {
-					filtered = append(filtered, a)
-				}
-			}
-			u.Articles[sym] = filtered
-		}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM articles WHERE published < $1`,
+		cutoff,
+	)
+	if err != nil {
+		return fmt.Errorf("prune old articles: %w", err)
 	}
 
-	return s.save()
+	return nil
 }

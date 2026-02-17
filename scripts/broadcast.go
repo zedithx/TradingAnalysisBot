@@ -1,11 +1,13 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -29,12 +31,6 @@ const useHTML = false
 // END OF MESSAGE — no need to edit below this line
 // =====================================================
 
-// UserData mirrors the storage struct to read users.json.
-type UserData struct {
-	ChatID  int64    `json:"chat_id"`
-	Symbols []string `json:"symbols"`
-}
-
 func main() {
 	// Load .env from project root
 	_ = godotenv.Load("../.env")
@@ -45,24 +41,38 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN not set. Make sure .env is in the project root.")
 	}
 
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "../data"
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	if supabaseURL == "" {
+		log.Fatal("SUPABASE_URL not set. Make sure .env is in the project root.")
 	}
 
-	// Read users.json
-	usersFile := dataDir + "/users.json"
-	data, err := os.ReadFile(usersFile)
+	// Connect to Supabase Postgres
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, supabaseURL)
 	if err != nil {
-		log.Fatalf("Could not read %s: %v", usersFile, err)
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	// Fetch all user chat IDs
+	rows, err := pool.Query(context.Background(), `SELECT chat_id FROM users`)
+	if err != nil {
+		log.Fatalf("Failed to query users: %v", err)
+	}
+	defer rows.Close()
+
+	var chatIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			log.Fatalf("Failed to scan chat_id: %v", err)
+		}
+		chatIDs = append(chatIDs, id)
 	}
 
-	var users map[string]*UserData
-	if err := json.Unmarshal(data, &users); err != nil {
-		log.Fatalf("Could not parse %s: %v", usersFile, err)
-	}
-
-	if len(users) == 0 {
+	if len(chatIDs) == 0 {
 		log.Println("No users found. Nothing to send.")
 		return
 	}
@@ -76,15 +86,15 @@ func main() {
 
 	// Send to all users
 	sent, failed := 0, 0
-	for _, u := range users {
-		msg := tgbotapi.NewMessage(u.ChatID, message)
+	for _, chatID := range chatIDs {
+		msg := tgbotapi.NewMessage(chatID, message)
 		if useHTML {
 			msg.ParseMode = tgbotapi.ModeHTML
 			msg.DisableWebPagePreview = true
 		}
 
 		if _, err := bot.Send(msg); err != nil {
-			log.Printf("Failed to send to %d: %v", u.ChatID, err)
+			log.Printf("Failed to send to %d: %v", chatID, err)
 			failed++
 		} else {
 			sent++
@@ -94,5 +104,5 @@ func main() {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	fmt.Printf("\nBroadcast complete: %d sent, %d failed, %d total users\n", sent, failed, len(users))
+	fmt.Printf("\nBroadcast complete: %d sent, %d failed, %d total users\n", sent, failed, len(chatIDs))
 }

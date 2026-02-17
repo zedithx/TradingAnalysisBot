@@ -11,10 +11,10 @@ import (
 
 // Config holds all configuration values for the application.
 type Config struct {
-	TelegramBotToken   string
-	OpenAIAPIKey       string
-	DataDir            string
-	AnalyseWhitelist   map[int64]bool
+	TelegramBotToken string
+	OpenAIAPIKey     string
+	SupabaseURL      string
+	AnalyseWhitelist map[int64]bool
 }
 
 // Load reads configuration from environment variables (with .env fallback).
@@ -32,9 +32,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("OPENAI_API_KEY environment variable is required")
 	}
 
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	if supabaseURL == "" {
+		return nil, fmt.Errorf("SUPABASE_URL environment variable is required")
 	}
 
 	whitelist := parseWhitelist(os.Getenv("ANALYSE_WHITELIST"))
@@ -42,7 +42,7 @@ func Load() (*Config, error) {
 	return &Config{
 		TelegramBotToken: token,
 		OpenAIAPIKey:     openaiKey,
-		DataDir:          dataDir,
+		SupabaseURL:      supabaseURL,
 		AnalyseWhitelist: whitelist,
 	}, nil
 }

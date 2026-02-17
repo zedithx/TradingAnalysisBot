@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,14 @@ type dailyUsage struct {
 	Count int
 }
 
+// pendingAction values: we're waiting for the user to reply with a symbol or "all".
+const (
+	pendingAdd     = "add"
+	pendingRemove  = "remove"
+	pendingNews    = "news"
+	pendingAnalyse = "analyse"
+)
+
 // Bot wraps the Telegram bot API and application dependencies.
 type Bot struct {
 	API              *tgbotapi.BotAPI
@@ -25,8 +34,11 @@ type Bot struct {
 	Analyser         *analysis.Analyser
 	AnalyseWhitelist map[int64]bool
 
-	usageMu      sync.Mutex
-	analyseUsage map[int64]*dailyUsage // userID -> daily usage
+	usageMu       sync.Mutex
+	analyseUsage  map[int64]*dailyUsage // userID -> daily usage
+	pendingMu       sync.Mutex
+	pendingAction   map[int64]string // chatID -> "add" | "remove" | "news" | "analyse"
+	pendingUserID   map[int64]int64  // chatID -> userID (for rate limit when handling pending)
 }
 
 const maxAnalysePerDay = 2
@@ -46,6 +58,8 @@ func New(token string, store *storage.Store, analyser *analysis.Analyser, whitel
 		Analyser:         analyser,
 		AnalyseWhitelist: whitelist,
 		analyseUsage:     make(map[int64]*dailyUsage),
+		pendingAction:    make(map[int64]string),
+		pendingUserID:    make(map[int64]int64),
 	}, nil
 }
 
@@ -85,8 +99,23 @@ func (b *Bot) Start() {
 		}
 
 		chatID := update.Message.Chat.ID
+		text := strings.TrimSpace(update.Message.Text)
 
 		if !update.Message.IsCommand() {
+			// Check if we're waiting for a symbol (add/remove)
+			b.pendingMu.Lock()
+			action := b.pendingAction[chatID]
+			if action != "" {
+				userID := b.pendingUserID[chatID]
+				delete(b.pendingAction, chatID)
+				delete(b.pendingUserID, chatID)
+				b.pendingMu.Unlock()
+				b.sendTyping(chatID)
+				b.handlePendingSymbol(chatID, userID, action, text)
+				continue
+			}
+			b.pendingMu.Unlock()
+
 			b.sendTyping(chatID)
 			b.sendText(chatID, "Invalid input. Type /help for a list of available commands and how to use them.")
 			continue
@@ -107,10 +136,10 @@ func (b *Bot) Start() {
 			b.handleList(update.Message)
 		case "news":
 			b.handleNews(update.Message)
-		case "reports":
-			b.handleReports(update.Message)
 		case "analyse":
 			b.handleAnalyse(update.Message)
+		case "reports":
+			b.handleReports(update.Message)
 		default:
 			b.sendText(chatID, fmt.Sprintf("Unknown command: /%s\nType /help for a list of available commands and how to use them.", update.Message.Command()))
 		}
