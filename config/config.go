@@ -15,6 +15,7 @@ type Config struct {
 	OpenAIAPIKey     string
 	SupabaseURL      string
 	AnalyseWhitelist map[int64]bool
+	IsProd           bool // true when APP_ENV=prod
 }
 
 // Load reads configuration from environment variables (with .env fallback).
@@ -22,9 +23,20 @@ func Load() (*Config, error) {
 	// Load .env file if it exists; ignore error if missing
 	_ = godotenv.Load()
 
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
-		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN environment variable is required")
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	isProd := env == "prod" || env == "production"
+
+	var token string
+	if isProd {
+		token = os.Getenv("TELEGRAM_BOT_TOKEN_PROD")
+		if token == "" {
+			return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN_PROD is required when APP_ENV=prod")
+		}
+	} else {
+		token = os.Getenv("TELEGRAM_BOT_TOKEN")
+		if token == "" {
+			return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+		}
 	}
 
 	openaiKey := os.Getenv("OPENAI_API_KEY")
@@ -44,6 +56,7 @@ func Load() (*Config, error) {
 		OpenAIAPIKey:     openaiKey,
 		SupabaseURL:      supabaseURL,
 		AnalyseWhitelist: whitelist,
+		IsProd:           isProd,
 	}, nil
 }
 

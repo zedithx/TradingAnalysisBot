@@ -20,6 +20,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	if cfg.IsProd {
+		log.Println("Running in PRODUCTION mode")
+	} else {
+		log.Println("Running in TEST mode")
+	}
 
 	// Initialize storage (Supabase Postgres)
 	store, err := storage.New(cfg.SupabaseURL)
@@ -38,9 +43,8 @@ func main() {
 		log.Fatalf("Failed to initialize bot: %v", err)
 	}
 
-	// Initialize and start the background news fetcher.
-	// Pass the bot's sendHTML as the notify callback so users get digest messages.
-	sched := scheduler.New(store, b.SendHTML)
+	// Initialize and start the background news fetcher (every 4 hours, with AI summaries).
+	sched := scheduler.New(store, b.SendHTML, analyser)
 	if err := sched.Start(); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}

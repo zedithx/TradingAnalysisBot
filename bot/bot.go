@@ -108,6 +108,25 @@ func (b *Bot) checkAnalyseLimit(userID int64) (allowed bool, remaining int) {
 	return true, maxAnalysePerDay - usage.Count
 }
 
+// requireEligible checks subscription status. If not eligible, sends paywall and invoice, returns true (blocked).
+// Caller should return when true. Returns false when eligible (proceed with command).
+func (b *Bot) requireEligible(chatID int64) bool {
+	if err := b.Store.RecordFirstUse(chatID); err != nil {
+		log.Printf("RecordFirstUse error: %v", err)
+	}
+	ok, err := b.Store.IsEligible(chatID)
+	if err != nil {
+		log.Printf("IsEligible error: %v", err)
+		return false // Proceed on error to avoid blocking users
+	}
+	if !ok {
+		b.sendText(chatID, "Subscribe for 100 Stars/month to use TradingNewsBot — watchlist, news, earnings, AI analysis.\n\nTap the button below to pay with Telegram Stars.")
+		b.sendSubscribeInvoice(chatID)
+		return true
+	}
+	return false
+}
+
 // Start begins polling for updates and dispatching commands.
 func (b *Bot) Start() {
 	u := tgbotapi.NewUpdate(0)
@@ -116,15 +135,37 @@ func (b *Bot) Start() {
 	updates := b.API.GetUpdatesChan(u)
 
 	for update := range updates {
+		// Handle PreCheckoutQuery (payment flow)
+		if update.PreCheckoutQuery != nil {
+			b.handlePreCheckout(update.PreCheckoutQuery)
+			continue
+		}
+
+		// Handle CallbackQuery (inline keyboard button presses)
+		if update.CallbackQuery != nil {
+			b.handleCallbackQuery(update.CallbackQuery)
+			continue
+		}
+
 		if update.Message == nil {
 			continue
 		}
 
 		chatID := update.Message.Chat.ID
+
+		// Handle successful payment
+		if update.Message.SuccessfulPayment != nil {
+			b.handleSuccessfulPayment(chatID, update.Message.SuccessfulPayment)
+			continue
+		}
+
 		text := strings.TrimSpace(update.Message.Text)
 
 		// Handle photo (watchlist image when in /add flow)
 		if len(update.Message.Photo) > 0 {
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.pendingMu.Lock()
 			action := b.pendingAction[chatID]
 			if action == pendingAdd {
@@ -143,6 +184,9 @@ func (b *Bot) Start() {
 		}
 
 		if !update.Message.IsCommand() {
+			if b.requireEligible(chatID) {
+				continue
+			}
 			// Check if we're waiting for a symbol (add/remove)
 			b.pendingMu.Lock()
 			action := b.pendingAction[chatID]
@@ -168,19 +212,44 @@ func (b *Bot) Start() {
 		case "start":
 			b.handleStart(update.Message)
 		case "help":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleHelp(update.Message)
 		case "add":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleAdd(update.Message)
 		case "remove":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleRemove(update.Message)
 		case "list":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleList(update.Message)
 		case "news":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleNews(update.Message)
 		case "analyse":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleAnalyse(update.Message)
 		case "reports":
+			if b.requireEligible(chatID) {
+				continue
+			}
 			b.handleReports(update.Message)
+		case "support":
+			b.handleSupport(update.Message)
+		case "terms":
+			b.handleTerms(update.Message)
 		default:
 			b.sendText(chatID, fmt.Sprintf("Unknown command: /%s\nType /help for a list of available commands and how to use them.", update.Message.Command()))
 		}

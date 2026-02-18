@@ -1,5 +1,8 @@
 .env*
+env.yaml
+env-test.yaml
+env-prod.yaml
 .history/
 data/
-scripts/broadcast
+scripts
 .DS_Store

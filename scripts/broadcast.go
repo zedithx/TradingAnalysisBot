@@ -20,13 +20,13 @@ const message = `Hey there! New update deployed 🚀
 
 <b>What's new:</b>
 
-1. <b>Photo watchlist</b> — Send /add, then send a screenshot of your watchlist. The bot extracts stock symbols and adds them automatically.
+1. <b>Price alerts</b> — Intraday and after-hours alerts when your watchlist moves.
 
-2. <b>Cleaner UX</b> — For /add, /remove, /news, and /analyse: just reply with a ticker (e.g. AAPL) or "all" for your watchlist. No need to retype the command.
+2. <b>Reports</b> — Morning snapshot and weekly recap delivered to you on schedule.
 
-3. <b>Supabase storage</b> — Data is now backed by the cloud. If you migrated, your watchlist should be intact. If not, use /add or send a photo to rebuild.
+3. <b>Photo watchlist</b> — Send /add, then send a screenshot of your watchlist. The bot extracts stock symbols and adds them automatically.
 
-Try /add and send a screenshot of your stocks — it should work pretty well! Let me know if anything breaks.`
+Let me know if anything breaks.`
 
 // Set to true to use HTML formatting in the message above.
 // When true, you can use <b>bold</b>, <i>italic</i>, <a href="...">links</a>.
@@ -41,9 +41,15 @@ func main() {
 	_ = godotenv.Load("../.env")
 	_ = godotenv.Load(".env")
 
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	env := os.Getenv("APP_ENV")
+	var token string
+	if env == "prod" || env == "production" {
+		token = os.Getenv("TELEGRAM_BOT_TOKEN_PROD")
+	} else {
+		token = os.Getenv("TELEGRAM_BOT_TOKEN")
+	}
 	if token == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN not set. Make sure .env is in the project root.")
+		log.Fatal("TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN_PROD not set. Set APP_ENV=prod for production.")
 	}
 
 	supabaseURL := os.Getenv("SUPABASE_URL")

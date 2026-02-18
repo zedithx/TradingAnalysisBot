@@ -185,3 +185,43 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+const summarizerPrompt = `You are a financial news summarizer. Given a list of recent headlines for a company, write a 2-4 sentence summary that captures the key developments, sentiment, and what matters for investors. Be concise and actionable. No fluff. Plain text only, no markdown.`
+
+// SummarizeHeadlines produces a brief AI summary of news headlines for a symbol.
+func (a *Analyser) SummarizeHeadlines(symbol string, headlines []string) (string, error) {
+	if len(headlines) == 0 {
+		return "No recent headlines.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Summarize these recent headlines for %s:\n\n", symbol))
+	for i, h := range headlines {
+		if i >= 10 {
+			sb.WriteString("...\n")
+			break
+		}
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, h))
+	}
+	sb.WriteString("\nProvide a 2-4 sentence summary.")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	completion, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT4oMini,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(summarizerPrompt),
+			openai.UserMessage(sb.String()),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("OpenAI API error: %w", err)
+	}
+
+	if len(completion.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+
+	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+}

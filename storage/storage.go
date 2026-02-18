@@ -53,7 +53,62 @@ func New(databaseURL string) (*Store, error) {
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	return &Store{pool: pool}, nil
+	store := &Store{pool: pool}
+	store.ensureTrialReminderColumns(ctx)
+	store.ensureAlertTriggersTable(ctx)
+	return store, nil
+}
+
+// ensureTrialReminderColumns adds trial reminder tracking columns if they don't exist.
+func (s *Store) ensureTrialReminderColumns(ctx context.Context) {
+	for _, q := range []string{
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_5d_sent BOOLEAN DEFAULT FALSE`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_1d_sent BOOLEAN DEFAULT FALSE`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_expired_sent BOOLEAN DEFAULT FALSE`,
+	} {
+		if _, err := s.pool.Exec(ctx, q); err != nil {
+			log.Printf("ensureTrialReminderColumns: %v", err)
+		}
+	}
+}
+
+// ensureAlertTriggersTable creates the alert_triggers table if it doesn't exist.
+func (s *Store) ensureAlertTriggersTable(ctx context.Context) {
+	_, err := s.pool.Exec(ctx,
+		`CREATE TABLE IF NOT EXISTS alert_triggers (
+			chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+			symbol TEXT NOT NULL,
+			trigger_type TEXT NOT NULL,
+			triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (chat_id, symbol, trigger_type)
+		)`)
+	if err != nil {
+		log.Printf("ensureAlertTriggersTable: %v", err)
+	}
+}
+
+// RecordAlertTrigger upserts the alert trigger timestamp for deduplication.
+func (s *Store) RecordAlertTrigger(chatID int64, symbol, triggerType string) error {
+	_, err := s.pool.Exec(context.Background(),
+		`INSERT INTO alert_triggers (chat_id, symbol, trigger_type, triggered_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (chat_id, symbol, trigger_type)
+		 DO UPDATE SET triggered_at = NOW()`,
+		chatID, symbol, triggerType)
+	return err
+}
+
+// WasAlertTriggeredInLast24h returns true if this alert was triggered in the last 24 hours.
+func (s *Store) WasAlertTriggeredInLast24h(chatID int64, symbol, triggerType string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT EXISTS(
+		 SELECT 1 FROM alert_triggers
+		 WHERE chat_id = $1 AND symbol = $2 AND trigger_type = $3
+		 AND triggered_at > NOW() - INTERVAL '24 hours'
+		)`,
+		chatID, symbol, triggerType).Scan(&ok)
+	return ok, err
 }
 
 // Close releases the connection pool.
@@ -61,12 +116,136 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
-// ensureUser creates a user row if it doesn't already exist.
+// ensureUser creates a user row if it doesn't already exist, and sets first_used_at.
 func (s *Store) ensureUser(ctx context.Context, chatID int64) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+		`INSERT INTO users (chat_id, first_used_at) VALUES ($1, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET first_used_at = COALESCE(users.first_used_at, NOW())`,
 		chatID,
 	)
+	return err
+}
+
+// IsEligible returns true if the user is in their free period or has an active subscription.
+func (s *Store) IsEligible(chatID int64) (bool, error) {
+	ctx := context.Background()
+	var firstUsedAt, subscribedUntil *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT first_used_at, subscribed_until FROM users WHERE chat_id = $1`,
+		chatID,
+	).Scan(&firstUsedAt, &subscribedUntil)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return true, nil // New user, not in DB yet — will be created and get free period
+		}
+		return false, err
+	}
+
+	now := time.Now().UTC()
+
+	// Active subscription
+	if subscribedUntil != nil && subscribedUntil.After(now) {
+		return true, nil
+	}
+
+	// Free period: first 30 days from first_used_at
+	if firstUsedAt != nil {
+		freeEnd := firstUsedAt.Add(30 * 24 * time.Hour)
+		if now.Before(freeEnd) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// RecordFirstUse sets first_used_at if not already set (idempotent).
+func (s *Store) RecordFirstUse(chatID int64) error {
+	ctx := context.Background()
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO users (chat_id, first_used_at) VALUES ($1, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET first_used_at = COALESCE(users.first_used_at, NOW())`,
+		chatID,
+	)
+	return err
+}
+
+// SetSubscribedUntil sets the user's subscription end date (for admin use).
+func (s *Store) SetSubscribedUntil(chatID int64, until time.Time) error {
+	ctx := context.Background()
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET subscribed_until = $2 WHERE chat_id = $1`,
+		chatID, until,
+	)
+	return err
+}
+
+// ExtendSubscription adds 30 days to the user's subscription (from now or from existing end, whichever is later).
+func (s *Store) ExtendSubscription(chatID int64) error {
+	ctx := context.Background()
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET subscribed_until = GREATEST(COALESCE(subscribed_until, NOW()), NOW()) + INTERVAL '30 days'
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	return err
+}
+
+// TrialReminderCandidate holds user data for trial reminder decisions.
+type TrialReminderCandidate struct {
+	ChatID           int64
+	FirstUsedAt      time.Time
+	Reminder5dSent   bool
+	Reminder1dSent   bool
+	ReminderExpiredSent bool
+}
+
+// GetTrialReminderCandidates returns users on free trial (no active subscription) with reminder flags.
+func (s *Store) GetTrialReminderCandidates() ([]TrialReminderCandidate, error) {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx,
+		`SELECT chat_id, first_used_at,
+		 COALESCE(trial_reminder_5d_sent, FALSE),
+		 COALESCE(trial_reminder_1d_sent, FALSE),
+		 COALESCE(trial_reminder_expired_sent, FALSE)
+		 FROM users
+		 WHERE first_used_at IS NOT NULL
+		 AND (subscribed_until IS NULL OR subscribed_until <= NOW())`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []TrialReminderCandidate
+	for rows.Next() {
+		var c TrialReminderCandidate
+		if err := rows.Scan(&c.ChatID, &c.FirstUsedAt, &c.Reminder5dSent, &c.Reminder1dSent, &c.ReminderExpiredSent); err != nil {
+			return result, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+// MarkTrialReminder5dSent marks the 5-day reminder as sent.
+func (s *Store) MarkTrialReminder5dSent(chatID int64) error {
+	_, err := s.pool.Exec(context.Background(),
+		`UPDATE users SET trial_reminder_5d_sent = TRUE WHERE chat_id = $1`, chatID)
+	return err
+}
+
+// MarkTrialReminder1dSent marks the 1-day reminder as sent.
+func (s *Store) MarkTrialReminder1dSent(chatID int64) error {
+	_, err := s.pool.Exec(context.Background(),
+		`UPDATE users SET trial_reminder_1d_sent = TRUE WHERE chat_id = $1`, chatID)
+	return err
+}
+
+// MarkTrialReminderExpiredSent marks the expired reminder as sent.
+func (s *Store) MarkTrialReminderExpiredSent(chatID int64) error {
+	_, err := s.pool.Exec(context.Background(),
+		`UPDATE users SET trial_reminder_expired_sent = TRUE WHERE chat_id = $1`, chatID)
 	return err
 }
 
