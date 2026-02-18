@@ -48,8 +48,13 @@ func (s *Scheduler) Start() error {
 		return err
 	}
 
+	// Earnings reminder: 1 day before report, daily at 9 AM UTC
+	if _, err := s.cron.AddFunc("0 9 * * *", s.sendEarningsReminders); err != nil {
+		return err
+	}
+
 	s.cron.Start()
-	log.Println("Scheduler started: fetching news every hour")
+	log.Println("Scheduler started: fetching news every hour, earnings reminders at 9 AM UTC")
 
 	// Run an initial fetch immediately so the cache isn't empty on startup
 	go s.fetchAllNews()
@@ -153,6 +158,73 @@ func (s *Scheduler) fetchAllNews() {
 	}
 
 	log.Printf("Background fetch: complete (%d total articles across %d symbols)", totalFetched, len(symbolUsers))
+}
+
+// sendEarningsReminders checks each user's watchlist for earnings reports tomorrow and sends reminders.
+func (s *Scheduler) sendEarningsReminders() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Earnings reminder: PANIC recovered: %v", r)
+		}
+	}()
+
+	if s.notify == nil {
+		return
+	}
+
+	log.Println("Earnings reminder: starting...")
+
+	users := s.store.GetAllUsers()
+	if len(users) == 0 {
+		return
+	}
+
+	tomorrow := time.Now().UTC().Add(24 * time.Hour)
+	tomorrowDate := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.UTC)
+
+	// chatID -> list of (symbol, quarter) with earnings tomorrow
+	userReminders := make(map[int64][]struct {
+		symbol string
+		quarter string
+		date time.Time
+	})
+
+	for _, u := range users {
+		for _, symbol := range u.Symbols {
+			info, err := yahoo.FetchEarnings(symbol)
+			if err != nil {
+				log.Printf("Earnings reminder: %s: %v", symbol, err)
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+
+			earningsDate := time.Date(info.EarningsDate.Year(), info.EarningsDate.Month(), info.EarningsDate.Day(), 0, 0, 0, 0, time.UTC)
+			if earningsDate.Equal(tomorrowDate) {
+				userReminders[u.ChatID] = append(userReminders[u.ChatID], struct {
+					symbol  string
+					quarter string
+					date   time.Time
+				}{symbol, info.Quarter, info.EarningsDate})
+			}
+
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+
+	for chatID, list := range userReminders {
+		if len(list) == 0 {
+			continue
+		}
+		var sb strings.Builder
+		sb.WriteString("<b>Earnings tomorrow</b>\n\n")
+		for _, r := range list {
+			sb.WriteString(fmt.Sprintf("• <b>%s</b> — %s (%s)\n", r.symbol, r.date.Format("Jan 02, 2006"), r.quarter))
+		}
+		sb.WriteString("\nUse /reports to see all upcoming earnings.")
+		s.notify(chatID, sb.String())
+	}
+
+	log.Printf("Earnings reminder: sent to %d users", len(userReminders))
 }
 
 // buildDigest constructs an HTML digest message from new articles grouped by symbol.

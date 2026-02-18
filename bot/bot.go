@@ -2,7 +2,9 @@ package bot
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,7 @@ type Bot struct {
 	Store            *storage.Store
 	Analyser         *analysis.Analyser
 	AnalyseWhitelist map[int64]bool
+	OpenAIAPIKey     string
 
 	usageMu       sync.Mutex
 	analyseUsage  map[int64]*dailyUsage // userID -> daily usage
@@ -43,8 +46,8 @@ type Bot struct {
 
 const maxAnalysePerDay = 2
 
-// New creates a new Bot with the given token, storage, analyser, and analyse whitelist.
-func New(token string, store *storage.Store, analyser *analysis.Analyser, whitelist map[int64]bool) (*Bot, error) {
+// New creates a new Bot with the given token, storage, analyser, whitelist, and OpenAI API key.
+func New(token string, store *storage.Store, analyser *analysis.Analyser, whitelist map[int64]bool, openaiKey string) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
@@ -57,10 +60,29 @@ func New(token string, store *storage.Store, analyser *analysis.Analyser, whitel
 		Store:            store,
 		Analyser:         analyser,
 		AnalyseWhitelist: whitelist,
+		OpenAIAPIKey:     openaiKey,
 		analyseUsage:     make(map[int64]*dailyUsage),
 		pendingAction:    make(map[int64]string),
 		pendingUserID:    make(map[int64]int64),
 	}, nil
+}
+
+// downloadFile fetches a file from Telegram by file ID and returns its bytes.
+func (b *Bot) downloadFile(fileID string) ([]byte, error) {
+	file, err := b.API.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	if err != nil {
+		return nil, fmt.Errorf("get file: %w", err)
+	}
+	url := file.Link(b.API.Token)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download: status %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 // checkAnalyseLimit returns true if the user is within their daily analyse limit.
@@ -100,6 +122,25 @@ func (b *Bot) Start() {
 
 		chatID := update.Message.Chat.ID
 		text := strings.TrimSpace(update.Message.Text)
+
+		// Handle photo (watchlist image when in /add flow)
+		if len(update.Message.Photo) > 0 {
+			b.pendingMu.Lock()
+			action := b.pendingAction[chatID]
+			if action == pendingAdd {
+				fileID := update.Message.Photo[len(update.Message.Photo)-1].FileID
+				delete(b.pendingAction, chatID)
+				delete(b.pendingUserID, chatID)
+				b.pendingMu.Unlock()
+				b.sendTyping(chatID)
+				b.handleAddFromPhoto(chatID, fileID)
+				continue
+			}
+			b.pendingMu.Unlock()
+			b.sendTyping(chatID)
+			b.sendText(chatID, "Send /add first, then send a photo of your watchlist to add multiple stocks at once.")
+			continue
+		}
 
 		if !update.Message.IsCommand() {
 			// Check if we're waiting for a symbol (add/remove)

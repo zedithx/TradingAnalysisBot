@@ -16,16 +16,21 @@ import (
 // =====================================================
 // EDIT YOUR BROADCAST MESSAGE HERE
 // =====================================================
-const message = `Hey there!
+const message = `Hey there! New update deployed 🚀
 
-I just deployed the bot on gcloud, it should now be up 100% of the time. Let me know if it goes down
-then niaoniaoniaoniaoooooooo. But your watchlist got resetted so pls readd your entire watchlist. Im thinking
-of adding a function to add by just screenshotting and sending the stocks, and using ocr to help u add.
-We shall see!`
+<b>What's new:</b>
+
+1. <b>Photo watchlist</b> — Send /add, then send a screenshot of your watchlist. The bot extracts stock symbols and adds them automatically.
+
+2. <b>Cleaner UX</b> — For /add, /remove, /news, and /analyse: just reply with a ticker (e.g. AAPL) or "all" for your watchlist. No need to retype the command.
+
+3. <b>Supabase storage</b> — Data is now backed by the cloud. If you migrated, your watchlist should be intact. If not, use /add or send a photo to rebuild.
+
+Try /add and send a screenshot of your stocks — it should work pretty well! Let me know if anything breaks.`
 
 // Set to true to use HTML formatting in the message above.
 // When true, you can use <b>bold</b>, <i>italic</i>, <a href="...">links</a>.
-const useHTML = false
+const useHTML = true
 
 // =====================================================
 // END OF MESSAGE — no need to edit below this line

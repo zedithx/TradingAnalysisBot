@@ -7,6 +7,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"TradingNewsBot/vision"
 	"TradingNewsBot/yahoo"
 )
 
@@ -59,6 +60,7 @@ func (b *Bot) handleHelp(msg *tgbotapi.Message) {
 
 1. BUILD YOUR WATCHLIST
 /add SYMBOL - Track a stock (e.g. /add AAPL)
+/add - Then send a photo of your watchlist to bulk-add stocks
 /remove SYMBOL - Stop tracking a stock
 /list - View your current watchlist
 
@@ -98,10 +100,89 @@ func (b *Bot) handleAdd(msg *tgbotapi.Message) {
 		b.pendingMu.Lock()
 		b.pendingAction[msg.Chat.ID] = pendingAdd
 		b.pendingMu.Unlock()
-		b.sendText(msg.Chat.ID, "Which stock would you like to add? Reply with the ticker (e.g. AAPL, MSFT, 005930.KS).")
+		b.sendText(msg.Chat.ID, "Reply with a ticker (e.g. AAPL) or send a photo of your watchlist to add multiple stocks at once.")
 		return
 	}
 	b.doAdd(msg.Chat.ID, symbol)
+}
+
+// handleAddFromPhoto extracts symbols from a watchlist image and adds them.
+func (b *Bot) handleAddFromPhoto(chatID int64, fileID string) {
+	b.sendText(chatID, "Scanning your watchlist...")
+
+	imageBytes, err := b.downloadFile(fileID)
+	if err != nil {
+		log.Printf("Download photo error: %v", err)
+		b.sendText(chatID, "Could not download the image. Please try again.")
+		return
+	}
+
+	symbols, err := vision.ExtractSymbols(imageBytes, b.OpenAIAPIKey)
+	if err != nil {
+		log.Printf("Vision extract error: %v", err)
+		b.sendText(chatID, "Could not extract symbols from the image. Try typing them one by one.")
+		return
+	}
+
+	if len(symbols) == 0 {
+		b.sendText(chatID, "No stock symbols found in the image. Try a clearer screenshot or type them one by one.")
+		return
+	}
+
+	existing := b.Store.GetSymbols(chatID)
+	slotLimit := 10
+	added, skipped, invalid := []string{}, []string{}, []string{}
+
+	for _, sym := range symbols {
+		if len(existing)+len(added) >= slotLimit {
+			skipped = append(skipped, sym+" (limit reached)")
+			continue
+		}
+		// Check duplicate in existing or already-added
+		dup := false
+		for _, s := range existing {
+			if s == sym {
+				dup = true
+				break
+			}
+		}
+		for _, s := range added {
+			if s == sym {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			skipped = append(skipped, sym+" (already in watchlist)")
+			continue
+		}
+		if err := yahoo.ValidateSymbol(sym); err != nil {
+			invalid = append(invalid, sym)
+			continue
+		}
+		if err := b.Store.AddSymbol(chatID, sym); err != nil {
+			invalid = append(invalid, sym)
+			continue
+		}
+		added = append(added, sym)
+	}
+
+	// Build result message
+	var parts []string
+	if len(added) > 0 {
+		parts = append(parts, fmt.Sprintf("Added: %s", strings.Join(added, ", ")))
+	}
+	if len(invalid) > 0 {
+		parts = append(parts, fmt.Sprintf("Skipped (not found): %s", strings.Join(invalid, ", ")))
+	}
+	if len(skipped) > 0 {
+		parts = append(parts, fmt.Sprintf("Skipped: %s", strings.Join(skipped, ", ")))
+	}
+	if len(parts) == 0 {
+		b.sendText(chatID, "No new symbols were added. Check that the image shows valid tickers (e.g. AAPL, 005930.KS).")
+		return
+	}
+	b.sendText(chatID, strings.Join(parts, "\n"))
 }
 
 // doAdd performs the add-symbol logic (used by handleAdd and handlePendingSymbol).
