@@ -5,6 +5,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -147,7 +148,11 @@ News headlines are one of the most important tools for gauging market sentiment.
 
 Earnings reports (Q1, Q2, Q3, Q4) are when companies publish their financial statements, including revenue, net income, expenses, and forward guidance. These are critical dates for any investor. Strong earnings can validate a company's growth trajectory, while misses can trigger sharp sell-offs. Knowing when reports are due helps you prepare for potential volatility and make informed decisions around those dates.
 
-4. AI ANALYSIS
+4. LIVE PRICE
+/price SYMBOL - Live price, % change, pre/post market, day range, volume
+/price - Reply with symbol or "all" for watchlist
+
+5. AI ANALYSIS
 /analyse SYMBOL - AI-powered analysis for a specific stock
 /analyse - AI analysis for all your watchlist stocks
 
@@ -335,9 +340,16 @@ func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 		b.doRemove(chatID, text)
 	case pendingNews:
 		b.doNews(chatID, text)
+	case pendingPrice:
+		b.doPrice(chatID, text)
 	case pendingAnalyse:
 		if userID == 0 {
 			userID = chatID // fallback for rate limit
+		}
+		allowed, _ := b.checkAnalyseLimit(userID)
+		if !allowed {
+			b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+			return
 		}
 		b.doAnalyse(chatID, userID, text)
 	}
@@ -358,24 +370,33 @@ func (b *Bot) handleList(msg *tgbotapi.Message) {
 	b.sendText(msg.Chat.ID, text)
 }
 
+// sendSymbolOrWatchlistKeyboard sends a message with inline buttons [Symbol] and [Watchlist].
+// prefix is used for callback data: prefix:symbol, prefix:watchlist.
+func (b *Bot) sendSymbolOrWatchlistKeyboard(chatID int64, prompt, prefix string) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Symbol", prefix+":symbol"),
+			tgbotapi.NewInlineKeyboardButtonData("Watchlist", prefix+":watchlist"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, prompt)
+	msg.ReplyMarkup = kb
+	if _, err := b.API.Send(msg); err != nil {
+		log.Printf("sendSymbolOrWatchlistKeyboard: %v", err)
+	}
+}
+
 // handleNews returns news articles. Supports:
-//   - /news        -> prompt: symbol or all
+//   - /news        -> inline keyboard: Symbol | Watchlist
 //   - /news SYMBOL -> fetch live news for that symbol
-//   - /news (then reply "all") -> cached news across watchlist
 func (b *Bot) handleNews(msg *tgbotapi.Message) {
 	arg := strings.TrimSpace(msg.CommandArguments())
 
-	// No arg — ask for symbol or all
 	if arg == "" {
-		b.pendingMu.Lock()
-		b.pendingAction[msg.Chat.ID] = pendingNews
-		b.pendingUserID[msg.Chat.ID] = msg.From.ID
-		b.pendingMu.Unlock()
-		b.sendText(msg.Chat.ID, "Which stock? Reply with a symbol (e.g. AAPL) or 'all' for your watchlist.")
+		b.sendSymbolOrWatchlistKeyboard(msg.Chat.ID, "Which stock?", "news")
 		return
 	}
 
-	// Specific symbol — fetch live
 	b.doNews(msg.Chat.ID, arg)
 }
 
@@ -450,6 +471,107 @@ func (b *Bot) doNews(chatID int64, arg string) {
 	b.SendHTML(chatID, text)
 }
 
+// handlePrice returns live price data. Supports:
+//   - /price        -> inline keyboard: Symbol | Watchlist
+//   - /price SYMBOL -> full trade-app style (regular, pre/post mkt, range, volume)
+func (b *Bot) handlePrice(msg *tgbotapi.Message) {
+	arg := strings.TrimSpace(msg.CommandArguments())
+
+	if arg == "" {
+		b.sendSymbolOrWatchlistKeyboard(msg.Chat.ID, "Which stock?", "price")
+		return
+	}
+
+	b.doPrice(msg.Chat.ID, arg)
+}
+
+// doPrice fetches and displays price for a symbol or all watchlist symbols.
+func (b *Bot) doPrice(chatID int64, arg string) {
+	arg = strings.TrimSpace(arg)
+	useAll := arg == "" || strings.EqualFold(arg, "all") || strings.EqualFold(arg, "watchlist")
+
+	if !useAll {
+		symbol := strings.ToUpper(arg)
+		b.sendTyping(chatID)
+
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+		if err != nil {
+			b.SendHTML(chatID, fmt.Sprintf("Could not fetch price for <b>%s</b>. Check the symbol and try again.", symbol))
+			log.Printf("FetchQuoteExtended %s: %v", symbol, err)
+			return
+		}
+
+		msg := formatPriceSingle(q)
+		b.SendHTML(chatID, msg)
+		return
+	}
+
+	// "all" — compact snapshot for watchlist
+	symbols := b.Store.GetSymbols(chatID)
+	if len(symbols) == 0 {
+		b.sendText(chatID, "Your watchlist is empty. Use /add to add stocks, or reply with a symbol.")
+		return
+	}
+
+	b.sendTyping(chatID)
+	var lines []string
+	for _, symbol := range symbols {
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+		if err != nil {
+			lines = append(lines, fmt.Sprintf("• <b>%s</b>: —", symbol))
+			log.Printf("FetchQuoteExtended %s: %v", symbol, err)
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		pctStr := fmt.Sprintf("%+.1f%%", q.ChangePercent)
+		lines = append(lines, fmt.Sprintf("• <b>%s</b> $%.2f %s", symbol, q.RegularMarketPrice, pctStr))
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	text := "<b>Price snapshot</b>\n\n" + strings.Join(lines, "\n")
+	b.SendHTML(chatID, text)
+}
+
+// formatPriceSingle formats extended quote as trade-app style message.
+func formatPriceSingle(q *yahoo.QuoteExtended) string {
+	pctStr := fmt.Sprintf("%+.1f%%", q.ChangePercent)
+	volStr := formatVolumeCompact(q.Volume)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("<b>%s</b>  $%.2f  <b>%s</b>\n\n", q.Symbol, q.RegularMarketPrice, pctStr))
+	sb.WriteString(fmt.Sprintf("Regular: $%.2f (%s)  |  Prev close $%.2f\n", q.RegularMarketPrice, pctStr, q.PreviousClose))
+	if q.DayHigh > 0 && q.DayLow > 0 {
+		sb.WriteString(fmt.Sprintf("Day range: $%.2f – $%.2f  |  Vol: %s\n", q.DayLow, q.DayHigh, volStr))
+	} else {
+		sb.WriteString(fmt.Sprintf("Vol: %s\n", volStr))
+	}
+
+	if q.PreMarketPrice > 0 && q.PreviousClose > 0 {
+		pmPct := (q.PreMarketPrice - q.PreviousClose) / q.PreviousClose * 100
+		sb.WriteString(fmt.Sprintf("\nPre-mkt: $%.2f (%+.1f%%)\n", q.PreMarketPrice, pmPct))
+	}
+	if q.PostMarketPrice > 0 && q.PreviousClose > 0 {
+		ahPct := (q.PostMarketPrice - q.PreviousClose) / q.PreviousClose * 100
+		sb.WriteString(fmt.Sprintf("Post-mkt: $%.2f (%+.1f%%)\n", q.PostMarketPrice, ahPct))
+	}
+
+	return sb.String()
+}
+
+// formatVolumeCompact returns human-readable volume (e.g. "45.2M", "1.2K").
+func formatVolumeCompact(v int64) string {
+	switch {
+	case v >= 1_000_000_000:
+		return fmt.Sprintf("%.2fB", float64(v)/1_000_000_000)
+	case v >= 1_000_000:
+		return fmt.Sprintf("%.2fM", float64(v)/1_000_000)
+	case v >= 1_000:
+		return fmt.Sprintf("%.1fK", float64(v)/1_000)
+	default:
+		return fmt.Sprintf("%d", v)
+	}
+}
+
 // handleReports shows upcoming earnings dates for the watchlist.
 func (b *Bot) handleReports(msg *tgbotapi.Message) {
 	b.handleReportsUpcoming(msg.Chat.ID)
@@ -461,6 +583,10 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		return
 	}
 	chatID := cq.Message.Chat.ID
+	userID := int64(0)
+	if cq.From != nil {
+		userID = cq.From.ID
+	}
 	data := cq.Data
 
 	cfg := tgbotapi.NewCallback(cq.ID, "")
@@ -476,6 +602,36 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	switch {
 	case len(parts) >= 2 && parts[0] == "reports" && parts[1] == "upcoming":
 		b.handleReportsUpcoming(chatID)
+	case len(parts) >= 2 && parts[0] == "news" && parts[1] == "watchlist":
+		b.doNews(chatID, "all")
+	case len(parts) >= 2 && parts[0] == "news" && parts[1] == "symbol":
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingNews
+		b.pendingUserID[chatID] = userID
+		b.pendingMu.Unlock()
+		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
+	case len(parts) >= 2 && parts[0] == "price" && parts[1] == "watchlist":
+		b.doPrice(chatID, "all")
+	case len(parts) >= 2 && parts[0] == "price" && parts[1] == "symbol":
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingPrice
+		b.pendingUserID[chatID] = userID
+		b.pendingMu.Unlock()
+		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
+	case len(parts) >= 2 && parts[0] == "analyse" && parts[1] == "watchlist":
+		allowed, _ := b.checkAnalyseLimit(userID)
+		if !allowed {
+			b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+			return
+		}
+		b.doAnalyse(chatID, userID, "all")
+	case len(parts) >= 2 && parts[0] == "analyse" && parts[1] == "symbol":
+		// Limit is checked when user submits symbol in handlePendingSymbol
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingAnalyse
+		b.pendingUserID[chatID] = userID
+		b.pendingMu.Unlock()
+		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
 	default:
 		b.sendText(chatID, "Unknown action.")
 	}
@@ -505,9 +661,8 @@ func (b *Bot) handleReportsUpcoming(chatID int64) {
 }
 
 // handleAnalyse generates an AI-powered stock analysis. Supports:
-//   - /analyse        -> prompt: symbol or all
+//   - /analyse        -> inline keyboard: Symbol | Watchlist
 //   - /analyse SYMBOL -> analyse a specific stock
-//   - /analyse (then reply "all") -> analyse all watchlist
 func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
 	// Check daily usage limit
 	allowed, _ := b.checkAnalyseLimit(msg.From.ID)
@@ -518,13 +673,8 @@ func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
 
 	arg := strings.TrimSpace(msg.CommandArguments())
 
-	// No arg — ask for symbol or all
 	if arg == "" {
-		b.pendingMu.Lock()
-		b.pendingAction[msg.Chat.ID] = pendingAnalyse
-		b.pendingUserID[msg.Chat.ID] = msg.From.ID
-		b.pendingMu.Unlock()
-		b.sendText(msg.Chat.ID, "Which stock? Reply with a symbol (e.g. AAPL) or 'all' for your watchlist.")
+		b.sendSymbolOrWatchlistKeyboard(msg.Chat.ID, "Which stock?", "analyse")
 		return
 	}
 

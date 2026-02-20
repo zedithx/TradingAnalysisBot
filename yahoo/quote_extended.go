@@ -101,3 +101,30 @@ func FetchQuoteExtended(symbol string) (*QuoteExtended, error) {
 		RegularMarketOpen:  p.RegularMarketOpen,
 	}, nil
 }
+
+// FetchQuoteExtendedWithFallback tries FetchQuoteExtended first (quoteSummary API).
+// If that fails (auth/API issues), falls back to FetchQuote (chart API, no auth).
+func FetchQuoteExtendedWithFallback(symbol string) (*QuoteExtended, error) {
+	q, err := FetchQuoteExtended(symbol)
+	if err == nil {
+		return q, nil
+	}
+	// Fallback: use chart API which doesn't require auth
+	d, err2 := FetchQuote(symbol)
+	if err2 != nil {
+		return nil, err // return original error
+	}
+	return &QuoteExtended{
+		Symbol:             d.Symbol,
+		RegularMarketPrice: d.RegularMarketPrice,
+		PreviousClose:      d.PreviousClose,
+		ChangePercent:      d.ChangePercent,
+		DayHigh:            d.DayHigh,
+		DayLow:             d.DayLow,
+		Volume:             d.Volume,
+		AverageVolume:      0,
+		PreMarketPrice:     0,
+		PostMarketPrice:    0,
+		RegularMarketOpen:  0,
+	}, nil
+}

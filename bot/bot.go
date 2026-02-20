@@ -27,6 +27,7 @@ const (
 	pendingRemove  = "remove"
 	pendingNews    = "news"
 	pendingAnalyse = "analyse"
+	pendingPrice   = "price"
 )
 
 // Bot wraps the Telegram bot API and application dependencies.
@@ -246,6 +247,11 @@ func (b *Bot) Start() {
 				continue
 			}
 			b.handleReports(update.Message)
+		case "price":
+			if b.requireEligible(chatID) {
+				continue
+			}
+			b.handlePrice(update.Message)
 		case "support":
 			b.handleSupport(update.Message)
 		case "terms":

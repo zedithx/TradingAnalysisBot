@@ -361,7 +361,7 @@ func (s *Scheduler) checkIntradayAlerts() {
 	userAlerts := make(map[int64][]string)
 
 	for symbol, chatIDs := range symbolToChatIDs {
-		q, err := yahoo.FetchQuoteExtended(symbol)
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
 		if err != nil {
 			log.Printf("Intraday alerts %s: %v", symbol, err)
 			time.Sleep(300 * time.Millisecond)
@@ -374,6 +374,11 @@ func (s *Scheduler) checkIntradayAlerts() {
 		chart1d, _ := yahoo.FetchChart(symbol, "1d", "1m")
 
 		var triggered []string
+		// Marginal move alert (1-3%): "stock increased marginally"
+		if (q.ChangePercent >= 1 && q.ChangePercent < 3) || (q.ChangePercent <= -1 && q.ChangePercent > -3) {
+			triggered = append(triggered, fmt.Sprintf("%+.1f%% (marginal)", q.ChangePercent))
+		}
+		// Significant move (3%+)
 		if q.ChangePercent >= 3 || q.ChangePercent <= -3 {
 			triggered = append(triggered, fmt.Sprintf("%+.1f%%", q.ChangePercent))
 		}
@@ -403,18 +408,26 @@ func (s *Scheduler) checkIntradayAlerts() {
 		}
 
 		line := fmt.Sprintf("<b>%s</b>: %s", symbol, strings.Join(triggered, " | "))
+		// Use separate trigger types: intraday_marginal (1-3%) vs intraday (3%+)
+		triggerType := "intraday"
+		for _, t := range triggered {
+			if strings.Contains(t, "marginal") {
+				triggerType = "intraday_marginal"
+				break
+			}
+		}
 
 		for _, chatID := range chatIDs {
 			eligible, _ := s.store.IsEligible(chatID)
 			if !eligible {
 				continue
 			}
-			ok, _ := s.store.WasAlertTriggeredInLast24h(chatID, symbol, "intraday")
+			ok, _ := s.store.WasAlertTriggeredInLast24h(chatID, symbol, triggerType)
 			if ok {
 				continue
 			}
 			userAlerts[chatID] = append(userAlerts[chatID], line)
-			_ = s.store.RecordAlertTrigger(chatID, symbol, "intraday")
+			_ = s.store.RecordAlertTrigger(chatID, symbol, triggerType)
 		}
 	}
 
@@ -465,10 +478,15 @@ func (s *Scheduler) sendMorningSnapshot() {
 			pct   float64
 		}
 		var moves []premarketMove
+		var regularSnapshot []struct {
+			symbol string
+			price  float64
+			pct    float64
+		}
 		var earningsToday []string
 
 		for _, symbol := range u.Symbols {
-			q, err := yahoo.FetchQuoteExtended(symbol)
+			q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
 			if err != nil {
 				log.Printf("Morning snapshot %s: %v", symbol, err)
 				time.Sleep(300 * time.Millisecond)
@@ -479,6 +497,13 @@ func (s *Scheduler) sendMorningSnapshot() {
 			if q.PreMarketPrice > 0 && q.PreviousClose > 0 {
 				pct := (q.PreMarketPrice - q.PreviousClose) / q.PreviousClose * 100
 				moves = append(moves, premarketMove{symbol, pct})
+			} else {
+				// No premarket data — use regular session for overview
+				regularSnapshot = append(regularSnapshot, struct {
+					symbol string
+					price  float64
+					pct    float64
+				}{symbol, q.RegularMarketPrice, q.ChangePercent})
 			}
 
 			info, err := yahoo.FetchEarnings(symbol)
@@ -491,12 +516,13 @@ func (s *Scheduler) sendMorningSnapshot() {
 			time.Sleep(200 * time.Millisecond)
 		}
 
-		if len(moves) == 0 && len(earningsToday) == 0 {
+		// Always send something if user has symbols
+		if len(moves) == 0 && len(regularSnapshot) == 0 && len(earningsToday) == 0 {
 			continue
 		}
 
 		var sb strings.Builder
-		sb.WriteString("<b>Good morning. Here's your watchlist premarket:</b>\n\n")
+		sb.WriteString("<b>Good morning. Here's your watchlist:</b>\n\n")
 
 		if len(moves) > 0 {
 			topGain := moves[0]
@@ -527,6 +553,13 @@ func (s *Scheduler) sendMorningSnapshot() {
 		}
 		if len(earningsToday) > 0 {
 			sb.WriteString(fmt.Sprintf("\n• Earnings today: %s\n", strings.Join(earningsToday, ", ")))
+		}
+		// Include regular market snapshot when no premarket or as supplement
+		if len(regularSnapshot) > 0 {
+			sb.WriteString("\n")
+			for _, r := range regularSnapshot {
+				sb.WriteString(fmt.Sprintf("• <b>%s</b> $%.2f %+.1f%%\n", r.symbol, r.price, r.pct))
+			}
 		}
 
 		s.notify(u.ChatID, sb.String())
@@ -566,7 +599,7 @@ func (s *Scheduler) checkAfterHoursAlerts() {
 
 	userAlerts := make(map[int64][]string)
 	for symbol, chatIDs := range symbolToChatIDs {
-		q, err := yahoo.FetchQuoteExtended(symbol)
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
 		if err != nil {
 			log.Printf("After-hours %s: %v", symbol, err)
 			time.Sleep(300 * time.Millisecond)
