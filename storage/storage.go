@@ -56,15 +56,17 @@ func New(databaseURL string) (*Store, error) {
 	store := &Store{pool: pool}
 	store.ensureTrialReminderColumns(ctx)
 	store.ensureAlertTriggersTable(ctx)
+	store.ensureSwingTraderTables(ctx)
 	return store, nil
 }
 
-// ensureTrialReminderColumns adds trial reminder tracking columns if they don't exist.
+// ensureTrialReminderColumns adds trial reminder and slots-expansion columns if they don't exist.
 func (s *Store) ensureTrialReminderColumns(ctx context.Context) {
 	for _, q := range []string{
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_5d_sent BOOLEAN DEFAULT FALSE`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_1d_sent BOOLEAN DEFAULT FALSE`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_expired_sent BOOLEAN DEFAULT FALSE`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS slots_expanded_until TIMESTAMPTZ`,
 	} {
 		if _, err := s.pool.Exec(ctx, q); err != nil {
 			log.Printf("ensureTrialReminderColumns: %v", err)
@@ -84,6 +86,56 @@ func (s *Store) ensureAlertTriggersTable(ctx context.Context) {
 		)`)
 	if err != nil {
 		log.Printf("ensureAlertTriggersTable: %v", err)
+	}
+}
+
+// ensureSwingTraderTables creates user_preferences, price_alerts, earnings_reminders, digest_article_state.
+func (s *Store) ensureSwingTraderTables(ctx context.Context) {
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS user_preferences (
+			chat_id BIGINT PRIMARY KEY REFERENCES users(chat_id) ON DELETE CASCADE,
+			digest_frequency_hours INT DEFAULT 4,
+			dnd_start_utc TIME,
+			dnd_end_utc TIME,
+			timezone TEXT,
+			last_digest_sent_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS price_alerts (
+			id SERIAL PRIMARY KEY,
+			chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+			symbol TEXT NOT NULL,
+			type TEXT NOT NULL,
+			threshold DOUBLE PRECISION NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE(chat_id, symbol, type)
+		)`,
+		`CREATE TABLE IF NOT EXISTS earnings_reminders (
+			chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+			symbol TEXT NOT NULL,
+			enabled BOOLEAN NOT NULL DEFAULT TRUE,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (chat_id, symbol)
+		)`,
+		`CREATE TABLE IF NOT EXISTS digest_article_state (
+			chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+			symbol TEXT NOT NULL,
+			article_link TEXT NOT NULL,
+			last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			delta_label TEXT,
+			PRIMARY KEY (chat_id, symbol, article_link)
+		)`,
+		`CREATE TABLE IF NOT EXISTS analyse_usage (
+			user_id BIGINT NOT NULL,
+			usage_date DATE NOT NULL,
+			count INT NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, usage_date)
+		)`,
+	} {
+		if _, err := s.pool.Exec(ctx, q); err != nil {
+			log.Printf("ensureSwingTraderTables: %v", err)
+		}
 	}
 }
 
@@ -185,6 +237,40 @@ func (s *Store) ExtendSubscription(chatID int64) error {
 	ctx := context.Background()
 	_, err := s.pool.Exec(ctx,
 		`UPDATE users SET subscribed_until = GREATEST(COALESCE(subscribed_until, NOW()), NOW()) + INTERVAL '30 days'
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	return err
+}
+
+// HasSlotsExpanded returns true if the user has an active slots expansion (20 instead of 10).
+func (s *Store) HasSlotsExpanded(chatID int64) (bool, error) {
+	ctx := context.Background()
+	var until *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT slots_expanded_until FROM users WHERE chat_id = $1`,
+		chatID,
+	).Scan(&until)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if until == nil {
+		return false, nil
+	}
+	return until.After(time.Now().UTC()), nil
+}
+
+// ExtendSlotsExpansion adds 30 days to the user's slots expansion (20 watchlist slots).
+func (s *Store) ExtendSlotsExpansion(chatID int64) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET slots_expanded_until = GREATEST(COALESCE(slots_expanded_until, NOW()), NOW()) + INTERVAL '30 days'
 		 WHERE chat_id = $1`,
 		chatID,
 	)
@@ -540,4 +626,331 @@ func (s *Store) PruneOldArticles() error {
 	}
 
 	return nil
+}
+
+// UserPreferences holds digest and DND settings.
+type UserPreferences struct {
+	ChatID               int64
+	DigestFrequencyHours int       // 2, 4, 8, or 24
+	DNDStartUTC          *time.Time
+	DNDEndUTC            *time.Time
+	Timezone             string
+	LastDigestSentAt     *time.Time
+}
+
+// GetPreferences returns user preferences, or defaults (4h digest) if none.
+func (s *Store) GetPreferences(chatID int64) (*UserPreferences, error) {
+	ctx := context.Background()
+	var p UserPreferences
+	var dndStart, dndEnd interface{}
+	var lastSent interface{}
+	err := s.pool.QueryRow(ctx,
+		`SELECT chat_id, COALESCE(digest_frequency_hours, 4), dnd_start_utc, dnd_end_utc,
+		 COALESCE(timezone, ''), last_digest_sent_at
+		 FROM user_preferences WHERE chat_id = $1`,
+		chatID,
+	).Scan(&p.ChatID, &p.DigestFrequencyHours, &dndStart, &dndEnd, &p.Timezone, &lastSent)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return &UserPreferences{ChatID: chatID, DigestFrequencyHours: 4}, nil
+		}
+		return nil, err
+	}
+	// Parse TIME columns as time.Time (UTC date + time)
+	if dndStart != nil {
+		if t, ok := dndStart.(time.Time); ok {
+			p.DNDStartUTC = &t
+		}
+	}
+	if dndEnd != nil {
+		if t, ok := dndEnd.(time.Time); ok {
+			p.DNDEndUTC = &t
+		}
+	}
+	if lastSent != nil {
+		if t, ok := lastSent.(time.Time); ok {
+			p.LastDigestSentAt = &t
+		}
+	}
+	return &p, nil
+}
+
+// SetPreferences upserts user preferences.
+func (s *Store) SetPreferences(chatID int64, freqHours int, dndStart, dndEnd *time.Time, timezone string) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	if freqHours != 2 && freqHours != 4 && freqHours != 8 && freqHours != 24 {
+		freqHours = 4
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_preferences (chat_id, digest_frequency_hours, dnd_start_utc, dnd_end_utc, timezone, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET
+		 digest_frequency_hours = $2, dnd_start_utc = $3, dnd_end_utc = $4, timezone = $5, updated_at = NOW()`,
+		chatID, freqHours, dndStart, dndEnd, timezone,
+	)
+	return err
+}
+
+// SetDigestFrequency sets digest frequency (2, 4, 8, 24 hours).
+func (s *Store) SetDigestFrequency(chatID int64, hours int) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	if hours != 2 && hours != 4 && hours != 8 && hours != 24 {
+		hours = 4
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_preferences (chat_id, digest_frequency_hours, updated_at)
+		 VALUES ($1, $2, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET digest_frequency_hours = $2, updated_at = NOW()`,
+		chatID, hours,
+	)
+	return err
+}
+
+// SetLastDigestSentAt records when the last digest was sent.
+func (s *Store) SetLastDigestSentAt(chatID int64, t time.Time) error {
+	_, err := s.pool.Exec(context.Background(),
+		`INSERT INTO user_preferences (chat_id, last_digest_sent_at, updated_at)
+		 VALUES ($1, $2, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET last_digest_sent_at = $2, updated_at = NOW()`,
+		chatID, t,
+	)
+	return err
+}
+
+// IsInDND returns true if the current UTC time falls within the user's DND window.
+func (s *Store) IsInDND(chatID int64, now time.Time) (bool, error) {
+	p, err := s.GetPreferences(chatID)
+	if err != nil || p.DNDStartUTC == nil || p.DNDEndUTC == nil {
+		return false, err
+	}
+	// Compare time-of-day (UTC)
+	nowTime := time.Date(0, 1, 1, now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
+	start := time.Date(0, 1, 1, p.DNDStartUTC.Hour(), p.DNDStartUTC.Minute(), p.DNDStartUTC.Second(), 0, time.UTC)
+	end := time.Date(0, 1, 1, p.DNDEndUTC.Hour(), p.DNDEndUTC.Minute(), p.DNDEndUTC.Second(), 0, time.UTC)
+	if start.Before(end) {
+		return !nowTime.Before(start) && nowTime.Before(end), nil
+	}
+	// DND spans midnight
+	return !nowTime.Before(start) || nowTime.Before(end), nil
+}
+
+// PriceAlert represents a user-defined price alert.
+type PriceAlert struct {
+	ID        int64
+	ChatID    int64
+	Symbol    string
+	Type      string // "pct" or "price"
+	Threshold float64
+	CreatedAt time.Time
+}
+
+// GetPriceAlerts returns all price alerts for a user.
+func (s *Store) GetPriceAlerts(chatID int64) ([]PriceAlert, error) {
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT id, chat_id, symbol, type, threshold, created_at FROM price_alerts WHERE chat_id = $1 ORDER BY symbol, type`,
+		chatID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []PriceAlert
+	for rows.Next() {
+		var a PriceAlert
+		if err := rows.Scan(&a.ID, &a.ChatID, &a.Symbol, &a.Type, &a.Threshold, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, a)
+	}
+	return result, rows.Err()
+}
+
+// GetPriceAlertSymbols returns distinct symbols that have at least one price alert.
+func (s *Store) GetPriceAlertSymbols() ([]string, error) {
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT DISTINCT symbol FROM price_alerts ORDER BY symbol`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		result = append(result, sym)
+	}
+	return result, rows.Err()
+}
+
+// GetPriceAlertsForSymbol returns price alerts for a given symbol (all users tracking it).
+func (s *Store) GetPriceAlertsForSymbol(symbol string) ([]PriceAlert, error) {
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT id, chat_id, symbol, type, threshold, created_at FROM price_alerts WHERE symbol = $1`,
+		symbol,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []PriceAlert
+	for rows.Next() {
+		var a PriceAlert
+		if err := rows.Scan(&a.ID, &a.ChatID, &a.Symbol, &a.Type, &a.Threshold, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, a)
+	}
+	return result, rows.Err()
+}
+
+// AddPriceAlert adds a price alert. type: "pct" or "price".
+func (s *Store) AddPriceAlert(chatID int64, symbol, alertType string, threshold float64) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if alertType != "pct" && alertType != "price" {
+		return fmt.Errorf("alert type must be pct or price")
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO price_alerts (chat_id, symbol, type, threshold)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (chat_id, symbol, type) DO UPDATE SET threshold = $4`,
+		chatID, symbol, alertType, threshold,
+	)
+	return err
+}
+
+// RemovePriceAlert removes a price alert by ID or by (chat_id, symbol, type).
+func (s *Store) RemovePriceAlert(chatID int64, symbol, alertType string) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	_, err := s.pool.Exec(context.Background(),
+		`DELETE FROM price_alerts WHERE chat_id = $1 AND symbol = $2 AND type = $3`,
+		chatID, symbol, alertType,
+	)
+	return err
+}
+
+// IsEarningsReminderEnabled returns true if reminder is enabled for (chatID, symbol). Default true if no row.
+func (s *Store) IsEarningsReminderEnabled(chatID int64, symbol string) (bool, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	var enabled bool
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT enabled FROM earnings_reminders WHERE chat_id = $1 AND symbol = $2`,
+		chatID, symbol,
+	).Scan(&enabled)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return true, nil
+		}
+		return false, err
+	}
+	return enabled, nil
+}
+
+// GetDigestArticleLinks returns article links previously sent in digest for (chatID, symbol).
+func (s *Store) GetDigestArticleLinks(chatID int64, symbol string) (map[string]bool, error) {
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT article_link FROM digest_article_state WHERE chat_id = $1 AND symbol = $2`,
+		chatID, symbol,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]bool)
+	for rows.Next() {
+		var link string
+		if err := rows.Scan(&link); err != nil {
+			return nil, err
+		}
+		result[link] = true
+	}
+	return result, rows.Err()
+}
+
+// RecordDigestArticles records article links sent in a digest for delta labeling.
+func (s *Store) RecordDigestArticles(chatID int64, symbol string, articles []CachedArticle) error {
+	ctx := context.Background()
+	for _, a := range articles {
+		_, err := s.pool.Exec(ctx,
+			`INSERT INTO digest_article_state (chat_id, symbol, article_link, last_seen_at, delta_label)
+			 VALUES ($1, $2, $3, NOW(), 'new')
+			 ON CONFLICT (chat_id, symbol, article_link) DO UPDATE SET last_seen_at = NOW(), delta_label = 'unchanged'`,
+			chatID, symbol, a.Link,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetAnalyseUsage returns the current daily usage count for a user. Does NOT increment.
+func (s *Store) GetAnalyseUsage(userID int64, maxPerDay int) (count int, remaining int, err error) {
+	today := time.Now().UTC().Format("2006-01-02")
+	err = s.pool.QueryRow(context.Background(),
+		`SELECT count FROM analyse_usage WHERE user_id = $1 AND usage_date = $2::date`,
+		userID, today,
+	).Scan(&count)
+	if err == pgx.ErrNoRows {
+		return 0, maxPerDay, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	remaining = maxPerDay - count
+	if remaining < 0 {
+		remaining = 0
+	}
+	return count, remaining, nil
+}
+
+// ConsumeAnalyseSlot atomically increments daily usage if under limit. Returns (allowed, remaining, err).
+func (s *Store) ConsumeAnalyseSlot(userID int64, maxPerDay int) (allowed bool, remaining int, err error) {
+	today := time.Now().UTC().Format("2006-01-02")
+	var count int
+	err = s.pool.QueryRow(context.Background(),
+		`INSERT INTO analyse_usage (user_id, usage_date, count)
+		 VALUES ($1, $2::date, 1)
+		 ON CONFLICT (user_id, usage_date)
+		 DO UPDATE SET count = analyse_usage.count + 1
+		 WHERE analyse_usage.count < $3
+		 RETURNING count`,
+		userID, today, maxPerDay,
+	).Scan(&count)
+	if err == pgx.ErrNoRows {
+		// At limit — no row updated
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, maxPerDay - count, nil
+}
+
+// SetEarningsReminder enables or disables earnings reminder for a symbol.
+func (s *Store) SetEarningsReminder(chatID int64, symbol string, enabled bool) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO earnings_reminders (chat_id, symbol, enabled, updated_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (chat_id, symbol) DO UPDATE SET enabled = $3, updated_at = NOW()`,
+		chatID, symbol, enabled,
+	)
+	return err
 }

@@ -24,9 +24,9 @@ func New(apiKey string) *Analyser {
 	return &Analyser{client: client}
 }
 
-// Analyse generates a market analysis for the given symbol using recent news and price data.
-func (a *Analyser) Analyse(symbol string, articles []storage.CachedArticle, quote *yahoo.QuoteData, earnings *yahoo.EarningsInfo) (string, error) {
-	prompt := buildPrompt(symbol, articles, quote, earnings)
+// Analyse generates a market analysis for the given symbol using recent news, price, earnings, and technicals.
+func (a *Analyser) Analyse(symbol string, articles []storage.CachedArticle, quote *yahoo.QuoteData, earnings *yahoo.EarningsInfo, technicals *yahoo.TechnicalSnapshot) (string, error) {
+	prompt := buildPrompt(symbol, articles, quote, earnings, technicals)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -77,6 +77,12 @@ POSITIONING TAKE
 • Conclude with a clear, actionable view: accumulate, hold, trim, or avoid
 • Specify conviction level (high / moderate / low) and time horizon
 
+Output structure (use these headers):
+• SHORT THESIS: Bullish / Bearish / Neutral for 1-4 weeks, with reasoning (news + technicals)
+• RISKS: Bullet list of key risks
+• KEY UPCOMING DATE: Next earnings or known catalyst
+• TECHNICAL CONTEXT: Price vs 50/200 MA, trend, RSI, support/resistance if available
+
 Rules:
 • Be direct and opinionated — don't hedge every sentence. Take a stance.
 • Use institutional language but keep it accessible. No jargon for jargon's sake.
@@ -87,7 +93,7 @@ Rules:
 • End with a one-line disclaimer: this is AI-generated analysis, not financial advice.`
 
 // buildPrompt constructs the user prompt with all available data for a stock.
-func buildPrompt(symbol string, articles []storage.CachedArticle, quote *yahoo.QuoteData, earnings *yahoo.EarningsInfo) string {
+func buildPrompt(symbol string, articles []storage.CachedArticle, quote *yahoo.QuoteData, earnings *yahoo.EarningsInfo, technicals *yahoo.TechnicalSnapshot) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("COVERAGE REQUEST: %s\n", symbol))
@@ -116,6 +122,30 @@ func buildPrompt(symbol string, articles []storage.CachedArticle, quote *yahoo.Q
 		sb.WriteString("\n")
 	} else {
 		sb.WriteString("--- PRICE ACTION ---\nNo live quote available.\n\n")
+	}
+
+	// Technicals
+	if technicals != nil {
+		sb.WriteString("--- TECHNICALS ---\n")
+		if technicals.PriceVs50 != "" {
+			sb.WriteString(fmt.Sprintf("Price vs 50 MA: %s", technicals.PriceVs50))
+			if technicals.Dist50Pct != 0 {
+				sb.WriteString(fmt.Sprintf(" (%.1f%% dist)", technicals.Dist50Pct))
+			}
+			sb.WriteString("\n")
+		}
+		if technicals.PriceVs200 != "" {
+			sb.WriteString(fmt.Sprintf("Price vs 200 MA: %s\n", technicals.PriceVs200))
+		}
+		if technicals.RSI > 0 {
+			sb.WriteString(fmt.Sprintf("RSI(14): %.1f\n", technicals.RSI))
+		}
+		if technicals.RecentHigh > 0 || technicals.RecentLow > 0 {
+			sb.WriteString(fmt.Sprintf("Recent 20d high: %.2f, low: %.2f (simple S/R)\n", technicals.RecentHigh, technicals.RecentLow))
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("--- TECHNICALS ---\nNo technical data available.\n\n")
 	}
 
 	// Earnings

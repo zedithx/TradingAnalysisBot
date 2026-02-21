@@ -41,8 +41,8 @@ func New(store *storage.Store, notify NotifyFunc, summariser NewsSummariser) *Sc
 
 // Start registers the fetch job (every 4 hours) and starts the cron scheduler.
 func (s *Scheduler) Start() error {
-	// Fetch news every 4 hours (0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC)
-	if _, err := s.cron.AddFunc("0 */4 * * *", s.fetchAllNews); err != nil {
+	// Fetch news every 2 hours; per-user digest frequency (2/4/8/24h) and DND are checked before send
+	if _, err := s.cron.AddFunc("0 */2 * * *", s.fetchAllNews); err != nil {
 		return err
 	}
 
@@ -67,6 +67,11 @@ func (s *Scheduler) Start() error {
 
 	// Intraday alerts: every 15 min during US market hours (14:00-20:59 UTC) Mon-Fri
 	if _, err := s.cron.AddFunc("*/15 14-20 * * 1-5", s.checkIntradayAlerts); err != nil {
+		return err
+	}
+
+	// User-defined price alerts: same schedule as intraday
+	if _, err := s.cron.AddFunc("*/15 14-20 * * 1-5", s.checkUserPriceAlerts); err != nil {
 		return err
 	}
 
@@ -102,6 +107,23 @@ func (s *Scheduler) Stop() {
 	ctx := s.cron.Stop()
 	<-ctx.Done()
 	log.Println("Scheduler stopped")
+}
+
+// RunJobForTest runs a named job synchronously. Used by tests only.
+// Valid names: "checkIntradayAlerts", "sendMorningSnapshot", "checkAfterHoursAlerts", "checkUserPriceAlerts".
+func (s *Scheduler) RunJobForTest(name string) {
+	switch name {
+	case "checkIntradayAlerts":
+		s.checkIntradayAlerts()
+	case "sendMorningSnapshot":
+		s.sendMorningSnapshot()
+	case "checkAfterHoursAlerts":
+		s.checkAfterHoursAlerts()
+	case "checkUserPriceAlerts":
+		s.checkUserPriceAlerts()
+	default:
+		log.Printf("RunJobForTest: unknown job %q", name)
+	}
 }
 
 // fetchAllNews iterates all users and fetches news for each of their symbols.
@@ -182,13 +204,36 @@ func (s *Scheduler) fetchAllNews() {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Send digest notifications to users with new articles
+	// Send digest notifications to users with new articles (respecting frequency + DND)
 	if s.notify != nil {
+		now := time.Now().UTC()
 		for chatID, symbolArticles := range userNewArticles {
-			msg := s.buildDigest(symbolArticles)
-			if msg != "" {
-				s.notify(chatID, msg)
+			msg := s.buildDigest(chatID, symbolArticles)
+			if msg == "" {
+				continue
 			}
+			prefs, err := s.store.GetPreferences(chatID)
+			if err != nil {
+				s.notify(chatID, msg)
+				_ = s.store.SetLastDigestSentAt(chatID, now)
+				continue
+			}
+			freqHours := 4
+			if prefs != nil {
+				freqHours = prefs.DigestFrequencyHours
+			}
+			if prefs != nil && prefs.LastDigestSentAt != nil {
+				elapsed := now.Sub(*prefs.LastDigestSentAt)
+				if elapsed < time.Duration(freqHours)*time.Hour {
+					continue
+				}
+			}
+			inDND, _ := s.store.IsInDND(chatID, now)
+			if inDND {
+				continue
+			}
+			s.notify(chatID, msg)
+			_ = s.store.SetLastDigestSentAt(chatID, now)
 		}
 	}
 
@@ -235,6 +280,10 @@ func (s *Scheduler) sendEarningsReminders() {
 
 			earningsDate := time.Date(info.EarningsDate.Year(), info.EarningsDate.Month(), info.EarningsDate.Day(), 0, 0, 0, 0, time.UTC)
 			if earningsDate.Equal(tomorrowDate) {
+				enabled, _ := s.store.IsEarningsReminderEnabled(u.ChatID, symbol)
+				if !enabled {
+					continue
+				}
 				userReminders[u.ChatID] = append(userReminders[u.ChatID], struct {
 					symbol  string
 					quarter string
@@ -444,6 +493,104 @@ func (s *Scheduler) checkIntradayAlerts() {
 	}
 }
 
+// checkUserPriceAlerts checks user-defined price alerts (pct or price level) and sends with news + AI summary.
+func (s *Scheduler) checkUserPriceAlerts() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("User price alerts: PANIC recovered: %v", r)
+		}
+	}()
+
+	if s.notify == nil {
+		return
+	}
+
+	symbols, err := s.store.GetPriceAlertSymbols()
+	if err != nil || len(symbols) == 0 {
+		return
+	}
+
+	for _, symbol := range symbols {
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+		if err != nil {
+			log.Printf("User price alerts %s: %v", symbol, err)
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		time.Sleep(200 * time.Millisecond)
+
+		alerts, err := s.store.GetPriceAlertsForSymbol(symbol)
+		if err != nil || len(alerts) == 0 {
+			continue
+		}
+
+		for _, a := range alerts {
+			triggered := false
+			triggerType := ""
+			triggerDesc := ""
+
+			switch a.Type {
+			case "pct":
+				absPct := q.ChangePercent
+				if absPct < 0 {
+					absPct = -absPct
+				}
+				if absPct >= a.Threshold {
+					triggered = true
+					triggerType = "price_pct"
+					triggerDesc = fmt.Sprintf("%+.1f%%", q.ChangePercent)
+				}
+			case "price":
+				// Alert when price crosses threshold (up or down)
+				if q.RegularMarketPrice >= a.Threshold*0.99 && q.RegularMarketPrice <= a.Threshold*1.01 {
+					triggered = true
+					triggerType = "price_level"
+					triggerDesc = fmt.Sprintf("$%.2f", q.RegularMarketPrice)
+				}
+			}
+
+			if !triggered {
+				continue
+			}
+
+			eligible, _ := s.store.IsEligible(a.ChatID)
+			if !eligible {
+				continue
+			}
+			ok, _ := s.store.WasAlertTriggeredInLast24h(a.ChatID, symbol, triggerType)
+			if ok {
+				continue
+			}
+
+			// Build message with news + AI summary
+			articles := s.store.GetLatestArticles(a.ChatID, symbol, 5)
+			headlines := make([]string, 0, len(articles))
+			for _, art := range articles {
+				headlines = append(headlines, art.Title)
+			}
+
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("<b>%s %s</b> — Price alert triggered\n\n", symbol, triggerDesc))
+			sb.WriteString("<b>Latest:</b>\n")
+			for i := 0; i < len(articles) && i < 3; i++ {
+				art := articles[i]
+				sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", art.Link, escapeHTML(art.Title)))
+			}
+			if s.summariser != nil && len(headlines) > 0 {
+				summary, err := s.summariser.SummarizeHeadlines(symbol, headlines)
+				if err == nil {
+					sb.WriteString("\n<b>AI summary:</b> ")
+					sb.WriteString(escapeHTML(summary))
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+
+			s.notify(a.ChatID, sb.String())
+			_ = s.store.RecordAlertTrigger(a.ChatID, symbol, triggerType)
+		}
+	}
+}
+
 // sendMorningSnapshot sends a weekday premarket snapshot: top gainer, loser, biggest move, earnings today.
 func (s *Scheduler) sendMorningSnapshot() {
 	defer func() {
@@ -566,7 +713,7 @@ func (s *Scheduler) sendMorningSnapshot() {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-		log.Println("Morning snapshot: sent")
+	log.Println("Morning snapshot: sent")
 }
 
 // checkAfterHoursAlerts notifies when a watchlist stock moves >5% in after-hours.
@@ -754,7 +901,8 @@ func (s *Scheduler) sendWeeklyRecap() {
 }
 
 // buildDigest constructs an HTML digest message. If summariser is set, uses AI summaries per company.
-func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticle) string {
+// Delta labels: [New] for articles not in previous digest.
+func (s *Scheduler) buildDigest(chatID int64, symbolArticles map[string][]storage.CachedArticle) string {
 	if len(symbolArticles) == 0 {
 		return ""
 	}
@@ -767,10 +915,17 @@ func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticl
 	}
 
 	totalArticles := 0
+	var articlesToRecord []struct {
+		symbol   string
+		articles []storage.CachedArticle
+	}
+
 	for symbol, articles := range symbolArticles {
 		if len(articles) == 0 {
 			continue
 		}
+
+		seen, _ := s.store.GetDigestArticleLinks(chatID, symbol)
 
 		sb.WriteString(fmt.Sprintf("\n<b>%s</b>\n", symbol))
 
@@ -782,21 +937,27 @@ func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticl
 			summary, err := s.summariser.SummarizeHeadlines(symbol, headlines)
 			if err != nil {
 				log.Printf("SummarizeHeadlines %s: %v", symbol, err)
-				// Fall back to raw headlines
 				for i := 0; i < len(articles) && i < 5; i++ {
 					a := articles[i]
-					sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", a.Link, escapeHTML(a.Title)))
+					prefix := ""
+					if !seen[a.Link] {
+						prefix = "[New] "
+					}
+					sb.WriteString(fmt.Sprintf("• %s<a href=\"%s\">%s</a>\n", prefix, a.Link, escapeHTML(a.Title)))
 				}
 			} else {
 				sb.WriteString(escapeHTML(summary))
 				sb.WriteString("\n")
-				// Include top 2 headline links for context
 				for i := 0; i < len(articles) && i < 2; i++ {
 					a := articles[i]
-					sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", a.Link, escapeHTML(a.Title)))
+					prefix := ""
+					if !seen[a.Link] {
+						prefix = "[New] "
+					}
+					sb.WriteString(fmt.Sprintf("• %s<a href=\"%s\">%s</a>\n", prefix, a.Link, escapeHTML(a.Title)))
 				}
 			}
-			time.Sleep(300 * time.Millisecond) // Rate limit AI calls
+			time.Sleep(300 * time.Millisecond)
 		} else {
 			limit := len(articles)
 			if limit > 5 {
@@ -804,7 +965,11 @@ func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticl
 			}
 			for i := 0; i < limit; i++ {
 				a := articles[i]
-				sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", a.Link, escapeHTML(a.Title)))
+				prefix := ""
+				if !seen[a.Link] {
+					prefix = "[New] "
+				}
+				sb.WriteString(fmt.Sprintf("• %s<a href=\"%s\">%s</a>\n", prefix, a.Link, escapeHTML(a.Title)))
 			}
 			if len(articles) > 5 {
 				sb.WriteString(fmt.Sprintf("  <i>+%d more</i>\n", len(articles)-5))
@@ -812,6 +977,10 @@ func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticl
 		}
 
 		totalArticles += len(articles)
+		articlesToRecord = append(articlesToRecord, struct {
+			symbol   string
+			articles []storage.CachedArticle
+		}{symbol, articles})
 	}
 
 	if totalArticles == 0 {
@@ -819,6 +988,11 @@ func (s *Scheduler) buildDigest(symbolArticles map[string][]storage.CachedArticl
 	}
 
 	sb.WriteString("\nUse /news for the full list.")
+
+	for _, r := range articlesToRecord {
+		_ = s.store.RecordDigestArticles(chatID, r.symbol, r.articles)
+	}
+
 	return sb.String()
 }
 

@@ -14,8 +14,9 @@ type Config struct {
 	TelegramBotToken string
 	OpenAIAPIKey     string
 	SupabaseURL      string
-	AnalyseWhitelist map[int64]bool
-	IsProd           bool // true when APP_ENV=prod
+	AnalyseWhitelist   map[int64]bool
+	WatchlistWhitelist map[int64]bool // user IDs that get 20 watchlist slots instead of 10
+	IsProd             bool           // true when APP_ENV=prod
 }
 
 // Load reads configuration from environment variables (with .env fallback).
@@ -49,14 +50,16 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SUPABASE_URL environment variable is required")
 	}
 
-	whitelist := parseWhitelist(os.Getenv("ANALYSE_WHITELIST"))
+	analyseWhitelist := parseWhitelist(os.Getenv("ANALYSE_WHITELIST"))
+	watchlistWhitelist := parseWhitelist(os.Getenv("WATCHLIST_WHITELIST"))
 
 	return &Config{
-		TelegramBotToken: token,
-		OpenAIAPIKey:     openaiKey,
-		SupabaseURL:      supabaseURL,
-		AnalyseWhitelist: whitelist,
-		IsProd:           isProd,
+		TelegramBotToken:    token,
+		OpenAIAPIKey:        openaiKey,
+		SupabaseURL:         supabaseURL,
+		AnalyseWhitelist:    analyseWhitelist,
+		WatchlistWhitelist:  watchlistWhitelist,
+		IsProd:              isProd,
 	}, nil
 }
 

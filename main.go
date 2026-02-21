@@ -38,7 +38,7 @@ func main() {
 	analyser := analysis.New(cfg.OpenAIAPIKey)
 
 	// Initialize Telegram bot
-	b, err := bot.New(cfg.TelegramBotToken, store, analyser, cfg.AnalyseWhitelist, cfg.OpenAIAPIKey)
+	b, err := bot.New(cfg.TelegramBotToken, store, analyser, cfg.AnalyseWhitelist, cfg.WatchlistWhitelist, cfg.OpenAIAPIKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize bot: %v", err)
 	}

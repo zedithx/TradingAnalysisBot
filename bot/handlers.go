@@ -46,6 +46,16 @@ func (b *Bot) sendSubscribeInvoice(chatID int64) {
 	)
 }
 
+// sendSlotsExpandInvoice sends a Telegram Stars invoice for 50 Stars — expand watchlist to 20 slots for 1 month.
+func (b *Bot) sendSlotsExpandInvoice(chatID int64) {
+	b.sendStarsInvoice(chatID,
+		"Expand watchlist — 20 slots for 1 month",
+		"Add up to 20 stocks instead of 10. Lasts 30 days.",
+		fmt.Sprintf("slots:%d", chatID),
+		[]tgbotapi.LabeledPrice{{Label: "1 month", Amount: 50}},
+	)
+}
+
 // handlePreCheckout responds to the pre-checkout query. Must answer within 10 seconds or payment is cancelled.
 func (b *Bot) handlePreCheckout(query *tgbotapi.PreCheckoutQuery) {
 	cfg := tgbotapi.PreCheckoutConfig{
@@ -59,27 +69,38 @@ func (b *Bot) handlePreCheckout(query *tgbotapi.PreCheckoutQuery) {
 	log.Printf("handlePreCheckout OK for query %s", query.ID)
 }
 
-// handleSuccessfulPayment processes a successful payment and extends subscription.
+// handleSuccessfulPayment processes a successful payment and extends subscription or slots expansion.
 func (b *Bot) handleSuccessfulPayment(chatID int64, payment *tgbotapi.SuccessfulPayment) {
 	payload := payment.InvoicePayload
-	if !strings.HasPrefix(payload, "sub:") {
+	parsedChatID := chatID
+	if idx := strings.Index(payload, ":"); idx >= 0 {
+		if idStr := strings.TrimSpace(payload[idx+1:]); idStr != "" {
+			if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
+				parsedChatID = id
+			}
+		}
+	}
+
+	switch {
+	case strings.HasPrefix(payload, "sub:"):
+		if err := b.Store.ExtendSubscription(parsedChatID); err != nil {
+			log.Printf("ExtendSubscription error: %v", err)
+			b.sendText(parsedChatID, "Payment received but there was an error activating your subscription. Contact me on Reddit: u/Logical-Albatross873")
+			return
+		}
+		b.sendText(parsedChatID, "Thanks! Your subscription is active for 30 days. Use /start to get going.")
+
+	case strings.HasPrefix(payload, "slots:"):
+		if err := b.Store.ExtendSlotsExpansion(parsedChatID); err != nil {
+			log.Printf("ExtendSlotsExpansion error: %v", err)
+			b.sendText(parsedChatID, "Payment received but there was an error. Contact me on Reddit: u/Logical-Albatross873")
+			return
+		}
+		b.sendText(parsedChatID, "Thanks! Your watchlist is now expanded to 20 slots for 30 days. Add more stocks with /add.")
+
+	default:
 		log.Printf("Unexpected invoice payload: %s", payload)
-		return
 	}
-	idStr := strings.TrimPrefix(payload, "sub:")
-	parsedChatID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		log.Printf("Parse payload chatID error: %v", err)
-		parsedChatID = chatID
-	}
-
-	if err := b.Store.ExtendSubscription(parsedChatID); err != nil {
-		log.Printf("SetSubscribedUntil error: %v", err)
-		b.sendText(parsedChatID, "Payment received but there was an error activating your subscription. Contact me on Reddit: u/Logical-Albatross873")
-		return
-	}
-
-	b.sendText(parsedChatID, "Thanks! Your subscription is active for 30 days. Use /start to get going.")
 }
 
 // handleSupport responds to /support (payment issues).
@@ -158,6 +179,14 @@ Earnings reports (Q1, Q2, Q3, Q4) are when companies publish their financial sta
 
 Consolidates recent news, live price data, and earnings information, then uses AI to provide a sentiment summary, key risk factors, and a short-term outlook.
 
+6. PRICE ALERTS
+/alerts - View or add custom price alerts
+/alerts AAPL 5% - Alert when AAPL moves ±5%
+/alerts AAPL 150 - Alert when AAPL hits $150
+
+7. SETTINGS
+/settings - Digest frequency (2h/4h/8h/24h)
+
 -- TIPS --
 Use exchange suffixes for non-US stocks:
   005930.KS (Samsung, Korea)
@@ -210,7 +239,7 @@ func (b *Bot) handleAddFromPhoto(chatID int64, fileID string) {
 	}
 
 	existing := b.Store.GetSymbols(chatID)
-	slotLimit := 10
+	slotLimit := b.getSlotLimit(chatID)
 	added, skipped, invalid := []string{}, []string{}, []string{}
 
 	for _, sym := range symbols {
@@ -263,6 +292,42 @@ func (b *Bot) handleAddFromPhoto(chatID int64, fileID string) {
 		return
 	}
 	b.sendText(chatID, strings.Join(parts, "\n"))
+	// If any were skipped due to limit and user has 10 slots, offer expansion
+	limitReached := false
+	for _, s := range skipped {
+		if strings.Contains(s, "(limit reached)") {
+			limitReached = true
+			break
+		}
+	}
+	if limitReached && b.getSlotLimit(chatID) == 10 {
+		b.sendText(chatID, "Expand to 20 slots for 50 Stars/month — tap below to pay.")
+		b.sendSlotsExpandInvoice(chatID)
+	}
+	if len(added) > 0 {
+		b.sendOnboardingKeyboard(chatID, added)
+	}
+}
+
+// sendOnboardingKeyboard sends "What would you like to do next?" with inline buttons.
+func (b *Bot) sendOnboardingKeyboard(chatID int64, symbols []string) {
+	symStr := ""
+	if len(symbols) > 0 {
+		symStr = " " + strings.Join(symbols, ", ")
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Set price alerts", "onboard:alerts"),
+			tgbotapi.NewInlineKeyboardButtonData("Digest frequency", "onboard:digest"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Earnings reminders", "onboard:earnings"),
+		),
+	)
+	payload := fmt.Sprintf("Added%s. What would you like to do next?", symStr)
+	msg := tgbotapi.NewMessage(chatID, payload)
+	msg.ReplyMarkup = kb
+	b.API.Send(msg)
 }
 
 // doAdd performs the add-symbol logic (used by handleAdd and handlePendingSymbol).
@@ -270,8 +335,14 @@ func (b *Bot) doAdd(chatID int64, symbol string) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 
 	existing := b.Store.GetSymbols(chatID)
-	if len(existing) >= 10 {
-		b.sendText(chatID, "You've reached the 10 stock limit. Please pay 5 dolla to 83055237 to unlock more slots.")
+	slotLimit := b.getSlotLimit(chatID)
+	if len(existing) >= slotLimit {
+		if slotLimit == 10 {
+			b.sendText(chatID, "You've reached the 10 stock limit. Expand to 20 slots for 50 Stars/month — tap below to pay.")
+			b.sendSlotsExpandInvoice(chatID)
+		} else {
+			b.sendText(chatID, "You've reached the 20 stock limit.")
+		}
 		return
 	}
 	for _, s := range existing {
@@ -294,7 +365,7 @@ func (b *Bot) doAdd(chatID int64, symbol string) {
 		return
 	}
 
-	b.sendText(chatID, fmt.Sprintf("Added %s to your watchlist. News will be fetched within the next hour.", symbol))
+	b.sendOnboardingKeyboard(chatID, []string{symbol})
 }
 
 // handleRemove removes a stock symbol from the user's watchlist.
@@ -342,13 +413,17 @@ func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 		b.doNews(chatID, text)
 	case pendingPrice:
 		b.doPrice(chatID, text)
+	case pendingAlerts:
+		b.handleAddPriceAlert(chatID, text)
+	case pendingDND:
+		b.handleSetDND(chatID, text)
 	case pendingAnalyse:
 		if userID == 0 {
 			userID = chatID // fallback for rate limit
 		}
-		allowed, _ := b.checkAnalyseLimit(userID)
+		allowed, _ := b.getAnalyseLimitStatus(userID)
 		if !allowed {
-			b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+			b.sendText(chatID, "You've used your 5 free analyses for today. Resets at midnight UTC.")
 			return
 		}
 		b.doAnalyse(chatID, userID, text)
@@ -577,6 +652,177 @@ func (b *Bot) handleReports(msg *tgbotapi.Message) {
 	b.handleReportsUpcoming(msg.Chat.ID)
 }
 
+// handleAlerts shows price alerts and lets user add/remove.
+func (b *Bot) handleAlerts(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	arg := strings.TrimSpace(msg.CommandArguments())
+
+	if arg != "" {
+		// Try to parse "AAPL 5%" or "AAPL 150"
+		b.handleAddPriceAlert(chatID, arg)
+		return
+	}
+
+	alerts, err := b.Store.GetPriceAlerts(chatID)
+	if err != nil {
+		b.sendText(chatID, "Could not load alerts.")
+		return
+	}
+
+	if len(alerts) == 0 {
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Add alert", "alerts:add"),
+			),
+		)
+		msg := tgbotapi.NewMessage(chatID, "No price alerts set.\n\nAdd one: <code>/alerts AAPL 5%</code> or <code>/alerts AAPL 150</code> (price level)")
+		msg.ReplyMarkup = kb
+		msg.ParseMode = tgbotapi.ModeHTML
+		b.API.Send(msg)
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<b>Your price alerts</b>\n\n")
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, a := range alerts {
+		desc := ""
+		if a.Type == "pct" {
+			desc = fmt.Sprintf("%s ±%.0f%%", a.Symbol, a.Threshold)
+		} else {
+			desc = fmt.Sprintf("%s $%.0f", a.Symbol, a.Threshold)
+		}
+		sb.WriteString(fmt.Sprintf("• %s\n", desc))
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Remove "+a.Symbol+" "+a.Type, "alerts:remove:"+a.Symbol+":"+a.Type),
+		))
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Add alert", "alerts:add"),
+	))
+
+	bm := tgbotapi.NewMessage(chatID, sb.String())
+	bm.ParseMode = tgbotapi.ModeHTML
+	bm.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	b.API.Send(bm)
+}
+
+// handleAddPriceAlert parses "AAPL 5%" or "AAPL 150" and adds the alert.
+func (b *Bot) handleAddPriceAlert(chatID int64, arg string) {
+	parts := strings.Fields(arg)
+	if len(parts) < 2 {
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingAlerts
+		b.pendingMu.Unlock()
+		b.sendText(chatID, "Usage: /alerts SYMBOL THRESHOLD\nExamples:\n• /alerts AAPL 5% — alert when AAPL moves ±5%\n• /alerts AAPL 150 — alert when AAPL hits $150")
+		return
+	}
+	symbol := strings.ToUpper(parts[0])
+	valStr := parts[1]
+	valStr = strings.TrimSuffix(valStr, "%")
+
+	threshold, err := strconv.ParseFloat(valStr, 64)
+	if err != nil || threshold <= 0 {
+		b.sendText(chatID, "Invalid threshold. Use a number (e.g. 5 for 5%, or 150 for $150).")
+		return
+	}
+
+	alertType := "price"
+	if strings.Contains(parts[1], "%") {
+		alertType = "pct"
+	}
+
+	if err := yahoo.ValidateSymbol(symbol); err != nil {
+		b.sendText(chatID, fmt.Sprintf("Symbol %s not found.", symbol))
+		return
+	}
+
+	if err := b.Store.AddPriceAlert(chatID, symbol, alertType, threshold); err != nil {
+		b.sendText(chatID, "Could not add alert.")
+		return
+	}
+
+	desc := ""
+	if alertType == "pct" {
+		desc = fmt.Sprintf("%s ±%.0f%%", symbol, threshold)
+	} else {
+		desc = fmt.Sprintf("%s $%.0f", symbol, threshold)
+	}
+	b.sendText(chatID, fmt.Sprintf("Alert added: %s. You'll get notified with news when it triggers.", desc))
+}
+
+// handleSetDND parses "HH:MM-HH:MM" (UTC) and sets DND window.
+func (b *Bot) handleSetDND(chatID int64, text string) {
+	text = strings.TrimSpace(text)
+	parts := strings.Split(text, "-")
+	if len(parts) != 2 {
+		b.sendText(chatID, "Format: HH:MM-HH:MM (e.g. 22:00-07:00)")
+		return
+	}
+	parseTime := func(s string) (int, int, bool) {
+		s = strings.TrimSpace(s)
+		seps := strings.Split(s, ":")
+		if len(seps) != 2 {
+			return 0, 0, false
+		}
+		h, eh := strconv.Atoi(strings.TrimSpace(seps[0]))
+		m, em := strconv.Atoi(strings.TrimSpace(seps[1]))
+		if eh != nil || em != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+			return 0, 0, false
+		}
+		return h, m, true
+	}
+	h1, m1, ok1 := parseTime(parts[0])
+	h2, m2, ok2 := parseTime(parts[1])
+	if !ok1 || !ok2 {
+		b.sendText(chatID, "Invalid time. Use HH:MM-HH:MM (e.g. 22:00-07:00)")
+		return
+	}
+	start := time.Date(1970, 1, 1, h1, m1, 0, 0, time.UTC)
+	end := time.Date(1970, 1, 1, h2, m2, 0, 0, time.UTC)
+	prefs, _ := b.Store.GetPreferences(chatID)
+	freq := 4
+	if prefs != nil {
+		freq = prefs.DigestFrequencyHours
+	}
+	if err := b.Store.SetPreferences(chatID, freq, &start, &end, ""); err != nil {
+		b.sendText(chatID, "Could not set DND.")
+		return
+	}
+	b.sendText(chatID, fmt.Sprintf("DND set: %02d:%02d - %02d:%02d UTC", h1, m1, h2, m2))
+}
+
+// handleSettings shows digest frequency and DND options (Phase 4).
+func (b *Bot) handleSettings(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	prefs, _ := b.Store.GetPreferences(chatID)
+	freq := 4
+	dndStr := "Off"
+	if prefs != nil {
+		freq = prefs.DigestFrequencyHours
+		if prefs.DNDStartUTC != nil && prefs.DNDEndUTC != nil {
+			dndStr = fmt.Sprintf("%02d:%02d - %02d:%02d UTC",
+				prefs.DNDStartUTC.Hour(), prefs.DNDStartUTC.Minute(),
+				prefs.DNDEndUTC.Hour(), prefs.DNDEndUTC.Minute())
+		}
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("2h", "settings:digest:2"),
+			tgbotapi.NewInlineKeyboardButtonData("4h", "settings:digest:4"),
+			tgbotapi.NewInlineKeyboardButtonData("8h", "settings:digest:8"),
+			tgbotapi.NewInlineKeyboardButtonData("24h", "settings:digest:24"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Set DND", "settings:dnd"),
+			tgbotapi.NewInlineKeyboardButtonData("Clear DND", "settings:dnd:clear"),
+		),
+	)
+	msgOut := tgbotapi.NewMessage(chatID, fmt.Sprintf("Digest: every %dh\nDND: %s\n\nTap to change:", freq, dndStr))
+	msgOut.ReplyMarkup = kb
+	b.API.Send(msgOut)
+}
+
 // handleCallbackQuery handles inline keyboard button presses.
 func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	if cq.Message == nil {
@@ -602,6 +848,20 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	switch {
 	case len(parts) >= 2 && parts[0] == "reports" && parts[1] == "upcoming":
 		b.handleReportsUpcoming(chatID)
+	case len(parts) >= 2 && strings.HasPrefix(parts[1], "remind:"):
+		sub := strings.TrimPrefix(parts[1], "remind:")
+		subParts := strings.Split(sub, ":")
+		if len(subParts) >= 2 {
+			sym := subParts[0]
+			enable := subParts[1] == "1"
+			_ = b.Store.SetEarningsReminder(chatID, sym, enable)
+			status := "Reminder on"
+			if !enable {
+				status = "Reminder off"
+			}
+			b.sendText(chatID, fmt.Sprintf("%s for %s.", status, sym))
+			b.handleReportsUpcoming(chatID)
+		}
 	case len(parts) >= 2 && parts[0] == "news" && parts[1] == "watchlist":
 		b.doNews(chatID, "all")
 	case len(parts) >= 2 && parts[0] == "news" && parts[1] == "symbol":
@@ -619,9 +879,9 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		b.pendingMu.Unlock()
 		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
 	case len(parts) >= 2 && parts[0] == "analyse" && parts[1] == "watchlist":
-		allowed, _ := b.checkAnalyseLimit(userID)
+		allowed, _ := b.getAnalyseLimitStatus(userID)
 		if !allowed {
-			b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+			b.sendText(chatID, "You've used your 5 free analyses for today. Resets at midnight UTC.")
 			return
 		}
 		b.doAnalyse(chatID, userID, "all")
@@ -632,12 +892,60 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		b.pendingUserID[chatID] = userID
 		b.pendingMu.Unlock()
 		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
+	case len(parts) >= 2 && parts[0] == "alerts" && parts[1] == "add":
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingAlerts
+		b.pendingUserID[chatID] = userID
+		b.pendingMu.Unlock()
+		b.SendHTML(chatID, "Type symbol and threshold, e.g. <code>AAPL 5%</code> or <code>AAPL 150</code>")
+	case len(parts) >= 2 && strings.HasPrefix(parts[1], "remove:"):
+		sub := strings.TrimPrefix(parts[1], "remove:")
+		subParts := strings.Split(sub, ":")
+		if len(subParts) >= 2 {
+			sym, atype := subParts[0], subParts[1]
+			if err := b.Store.RemovePriceAlert(chatID, sym, atype); err != nil {
+				b.sendText(chatID, "Could not remove alert.")
+			} else {
+				b.sendText(chatID, fmt.Sprintf("Removed %s %s alert.", sym, atype))
+			}
+			b.handleAlerts(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})
+		}
+	case len(parts) >= 2 && strings.HasPrefix(parts[1], "digest:"):
+		sub := strings.TrimPrefix(parts[1], "digest:")
+		if h, err := strconv.Atoi(sub); err == nil && (h == 2 || h == 4 || h == 8 || h == 24) {
+			_ = b.Store.SetDigestFrequency(chatID, h)
+			b.sendText(chatID, fmt.Sprintf("Digest frequency set to every %d hours.", h))
+		}
+	case len(parts) >= 2 && parts[1] == "dnd":
+		b.pendingMu.Lock()
+		b.pendingAction[chatID] = pendingDND
+		b.pendingUserID[chatID] = userID
+		b.pendingMu.Unlock()
+		b.SendHTML(chatID, "Reply with DND window in UTC, e.g. <code>22:00-07:00</code> (10 PM to 7 AM). No digests or alerts will be sent during this time.")
+	case len(parts) >= 2 && parts[0] == "onboard":
+		switch parts[1] {
+		case "alerts":
+			b.handleAlerts(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})
+		case "digest":
+			b.handleSettings(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})
+		case "earnings":
+			b.handleReportsUpcoming(chatID)
+			b.sendText(chatID, "Use /reports to see earnings. Toggle reminders per stock there.")
+		}
+	case len(parts) >= 2 && parts[1] == "dnd:clear":
+		prefs, _ := b.Store.GetPreferences(chatID)
+		freq := 4
+		if prefs != nil {
+			freq = prefs.DigestFrequencyHours
+		}
+		_ = b.Store.SetPreferences(chatID, freq, nil, nil, "")
+		b.sendText(chatID, "DND cleared.")
 	default:
 		b.sendText(chatID, "Unknown action.")
 	}
 }
 
-// handleReportsUpcoming shows upcoming earnings dates for watchlist.
+// handleReportsUpcoming shows upcoming earnings: "This week" and "Later", with reminder toggles.
 func (b *Bot) handleReportsUpcoming(chatID int64) {
 	symbols := b.Store.GetSymbols(chatID)
 	if len(symbols) == 0 {
@@ -646,28 +954,94 @@ func (b *Bot) handleReportsUpcoming(chatID int64) {
 	}
 
 	b.sendTyping(chatID)
-	text := "<b>Upcoming Earnings Reports</b>\n\n"
+	now := time.Now().UTC()
+	weekEnd := now.Add(7 * 24 * time.Hour)
+	var thisWeek, later []struct {
+		symbol string
+		date   time.Time
+		quarter string
+	}
+
 	for _, symbol := range symbols {
 		info, err := yahoo.FetchEarnings(symbol)
 		if err != nil {
-			text += fmt.Sprintf("• <b>%s</b>: No earnings date available\n", symbol)
 			log.Printf("Earnings fetch error for %s: %v", symbol, err)
 			continue
 		}
-		text += fmt.Sprintf("• <b>%s</b>: %s (%s)\n",
-			symbol, info.EarningsDate.Format("Jan 02, 2006"), info.Quarter)
+		ed := time.Date(info.EarningsDate.Year(), info.EarningsDate.Month(), info.EarningsDate.Day(), 0, 0, 0, 0, time.UTC)
+		entry := struct {
+			symbol  string
+			date    time.Time
+			quarter string
+		}{symbol, ed, info.Quarter}
+		if !ed.Before(now) && ed.Before(weekEnd) {
+			thisWeek = append(thisWeek, entry)
+		} else if !ed.Before(weekEnd) {
+			later = append(later, entry)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	b.SendHTML(chatID, text)
+
+	var sb strings.Builder
+	sb.WriteString("<b>Upcoming Earnings Reports</b>\n\n")
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	if len(thisWeek) > 0 {
+		sb.WriteString("<b>This week</b>\n")
+		for _, e := range thisWeek {
+			enabled, _ := b.Store.IsEarningsReminderEnabled(chatID, e.symbol)
+			remindLabel := "Don't remind"
+			remindVal := "0"
+			if !enabled {
+				remindLabel = "Remind me"
+				remindVal = "1"
+			}
+			sb.WriteString(fmt.Sprintf("• <b>%s</b>: %s (%s) [%s]\n",
+				e.symbol, e.date.Format("Jan 02, 2006"), e.quarter, map[bool]string{true: "reminder on", false: "reminder off"}[enabled]))
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(remindLabel+" "+e.symbol, "reports:remind:"+e.symbol+":"+remindVal),
+			))
+		}
+		sb.WriteString("\n")
+	}
+	if len(later) > 0 {
+		sb.WriteString("<b>Later</b>\n")
+		for _, e := range later {
+			enabled, _ := b.Store.IsEarningsReminderEnabled(chatID, e.symbol)
+			remindLabel := "Don't remind"
+			remindVal := "0"
+			if !enabled {
+				remindLabel = "Remind me"
+				remindVal = "1"
+			}
+			sb.WriteString(fmt.Sprintf("• <b>%s</b>: %s (%s) [%s]\n",
+				e.symbol, e.date.Format("Jan 02, 2006"), e.quarter, map[bool]string{true: "reminder on", false: "reminder off"}[enabled]))
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(remindLabel+" "+e.symbol, "reports:remind:"+e.symbol+":"+remindVal),
+			))
+		}
+	}
+
+	if len(thisWeek) == 0 && len(later) == 0 {
+		sb.WriteString("No upcoming earnings dates found for your watchlist.")
+	}
+
+	msg := tgbotapi.NewMessage(chatID, sb.String())
+	msg.ParseMode = tgbotapi.ModeHTML
+	if len(rows) > 0 {
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	}
+	b.API.Send(msg)
 }
 
 // handleAnalyse generates an AI-powered stock analysis. Supports:
 //   - /analyse        -> inline keyboard: Symbol | Watchlist
 //   - /analyse SYMBOL -> analyse a specific stock
 func (b *Bot) handleAnalyse(msg *tgbotapi.Message) {
-	// Check daily usage limit
-	allowed, _ := b.checkAnalyseLimit(msg.From.ID)
+	// Check daily usage limit (read-only; slot consumed in doAnalyse)
+	allowed, _ := b.getAnalyseLimitStatus(msg.From.ID)
 	if !allowed {
-		b.sendText(msg.Chat.ID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+		b.sendText(msg.Chat.ID, "You've used your 5 free analyses for today. Resets at midnight UTC.")
 		return
 	}
 
@@ -697,9 +1071,9 @@ func (b *Bot) doAnalyse(chatID, userID int64, arg string) {
 		symbols = []string{strings.ToUpper(arg)}
 	}
 
-	allowed, remaining := b.checkAnalyseLimit(userID)
+	allowed, remaining := b.consumeAnalyseSlot(userID)
 	if !allowed {
-		b.sendText(chatID, "You've used your 2 free analyses for today. Resets at midnight UTC.")
+		b.sendText(chatID, "You've used your 5 free analyses for today. Resets at midnight UTC.")
 		return
 	}
 
@@ -718,10 +1092,14 @@ func (b *Bot) doAnalyse(chatID, userID int64, arg string) {
 		earnings, err := yahoo.FetchEarnings(symbol)
 		if err != nil {
 			log.Printf("Earnings fetch error for %s: %v", symbol, err)
-			// Continue with nil earnings
 		}
 
-		result, err := b.Analyser.Analyse(symbol, articles, quote, earnings)
+		technicals, _ := yahoo.ComputeTechnicals(symbol)
+		if technicals == nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		result, err := b.Analyser.Analyse(symbol, articles, quote, earnings, technicals)
 		if err != nil {
 			b.sendText(chatID, fmt.Sprintf("Could not generate analysis for %s: %v", symbol, err))
 			log.Printf("Analysis error for %s: %v", symbol, err)

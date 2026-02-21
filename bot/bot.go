@@ -7,19 +7,12 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"TradingNewsBot/analysis"
 	"TradingNewsBot/storage"
 )
-
-// dailyUsage tracks how many times a user has called /analyse today.
-type dailyUsage struct {
-	Date  string // "2006-01-02"
-	Count int
-}
 
 // pendingAction values: we're waiting for the user to reply with a symbol or "all".
 const (
@@ -28,27 +21,72 @@ const (
 	pendingNews    = "news"
 	pendingAnalyse = "analyse"
 	pendingPrice   = "price"
+	pendingAlerts  = "alerts"
+	pendingDND     = "dnd"
 )
 
 // Bot wraps the Telegram bot API and application dependencies.
 type Bot struct {
 	API              *tgbotapi.BotAPI
 	Store            *storage.Store
-	Analyser         *analysis.Analyser
-	AnalyseWhitelist map[int64]bool
-	OpenAIAPIKey     string
+	Analyser            *analysis.Analyser
+	AnalyseWhitelist    map[int64]bool
+	WatchlistWhitelist  map[int64]bool // user IDs that get 20 watchlist slots instead of 10
+	OpenAIAPIKey        string
 
-	usageMu       sync.Mutex
-	analyseUsage  map[int64]*dailyUsage // userID -> daily usage
 	pendingMu       sync.Mutex
 	pendingAction   map[int64]string // chatID -> "add" | "remove" | "news" | "analyse"
 	pendingUserID   map[int64]int64  // chatID -> userID (for rate limit when handling pending)
 }
 
-const maxAnalysePerDay = 2
+const maxAnalysePerDay = 5
 
-// New creates a new Bot with the given token, storage, analyser, whitelist, and OpenAI API key.
-func New(token string, store *storage.Store, analyser *analysis.Analyser, whitelist map[int64]bool, openaiKey string) (*Bot, error) {
+// getAnalyseLimitStatus returns whether the user can analyse and how many remain. Does NOT increment.
+// Whitelisted users (ANALYSE_WHITELIST) bypass the limit entirely.
+func (b *Bot) getAnalyseLimitStatus(userID int64) (allowed bool, remaining int) {
+	if b.AnalyseWhitelist[userID] {
+		return true, maxAnalysePerDay
+	}
+	_, remaining, err := b.Store.GetAnalyseUsage(userID, maxAnalysePerDay)
+	if err != nil {
+		log.Printf("GetAnalyseUsage error: %v", err)
+		return true, maxAnalysePerDay // Proceed on error to avoid blocking
+	}
+	return remaining > 0, remaining
+}
+
+// getSlotLimit returns max watchlist slots for the user (20 if whitelisted or paid for expansion, 10 otherwise).
+func (b *Bot) getSlotLimit(chatID int64) int {
+	if b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID] {
+		return 20
+	}
+	expanded, err := b.Store.HasSlotsExpanded(chatID)
+	if err != nil {
+		log.Printf("HasSlotsExpanded error: %v", err)
+		return 10
+	}
+	if expanded {
+		return 20
+	}
+	return 10
+}
+
+// consumeAnalyseSlot increments the daily count in DB. Call only once per actual analysis (in doAnalyse).
+// Whitelisted users bypass the limit and do not consume a slot.
+func (b *Bot) consumeAnalyseSlot(userID int64) (allowed bool, remaining int) {
+	if b.AnalyseWhitelist[userID] {
+		return true, maxAnalysePerDay
+	}
+	allowed, remaining, err := b.Store.ConsumeAnalyseSlot(userID, maxAnalysePerDay)
+	if err != nil {
+		log.Printf("ConsumeAnalyseSlot error: %v", err)
+		return false, 0
+	}
+	return allowed, remaining
+}
+
+// New creates a new Bot with the given token, storage, analyser, whitelists, and OpenAI API key.
+func New(token string, store *storage.Store, analyser *analysis.Analyser, analyseWhitelist, watchlistWhitelist map[int64]bool, openaiKey string) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
@@ -57,14 +95,14 @@ func New(token string, store *storage.Store, analyser *analysis.Analyser, whitel
 	log.Printf("Authorized on Telegram as @%s", api.Self.UserName)
 
 	return &Bot{
-		API:              api,
-		Store:            store,
-		Analyser:         analyser,
-		AnalyseWhitelist: whitelist,
-		OpenAIAPIKey:     openaiKey,
-		analyseUsage:     make(map[int64]*dailyUsage),
-		pendingAction:    make(map[int64]string),
-		pendingUserID:    make(map[int64]int64),
+		API:                 api,
+		Store:               store,
+		Analyser:            analyser,
+		AnalyseWhitelist:    analyseWhitelist,
+		WatchlistWhitelist:  watchlistWhitelist,
+		OpenAIAPIKey:        openaiKey,
+		pendingAction:       make(map[int64]string),
+		pendingUserID:       make(map[int64]int64),
 	}, nil
 }
 
@@ -84,29 +122,6 @@ func (b *Bot) downloadFile(fileID string) ([]byte, error) {
 		return nil, fmt.Errorf("download: status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
-}
-
-// checkAnalyseLimit returns true if the user is within their daily analyse limit.
-// It also increments the counter for the current call.
-func (b *Bot) checkAnalyseLimit(userID int64) (allowed bool, remaining int) {
-	b.usageMu.Lock()
-	defer b.usageMu.Unlock()
-
-	today := time.Now().UTC().Format("2006-01-02")
-
-	usage, ok := b.analyseUsage[userID]
-	if !ok || usage.Date != today {
-		// New day or first use — reset
-		usage = &dailyUsage{Date: today, Count: 0}
-		b.analyseUsage[userID] = usage
-	}
-
-	if usage.Count >= maxAnalysePerDay {
-		return false, 0
-	}
-
-	usage.Count++
-	return true, maxAnalysePerDay - usage.Count
 }
 
 // requireEligible checks subscription status. If not eligible, sends paywall and invoice, returns true (blocked).
@@ -252,6 +267,16 @@ func (b *Bot) Start() {
 				continue
 			}
 			b.handlePrice(update.Message)
+		case "alerts":
+			if b.requireEligible(chatID) {
+				continue
+			}
+			b.handleAlerts(update.Message)
+		case "settings":
+			if b.requireEligible(chatID) {
+				continue
+			}
+			b.handleSettings(update.Message)
 		case "support":
 			b.handleSupport(update.Message)
 		case "terms":
