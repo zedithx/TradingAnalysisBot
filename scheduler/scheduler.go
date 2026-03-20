@@ -3,13 +3,42 @@ package scheduler
 import (
 	"fmt"
 	"log"
+	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/robfig/cron/v3"
 
 	"TradingNewsBot/storage"
 	"TradingNewsBot/yahoo"
+)
+
+const (
+	// Hourly cadence across pre/regular/post windows.
+	marketAlertSchedulePrimary   = "0 9-23 * * 1-5"
+	marketAlertScheduleOvernight = "0 0-3 * * 2-6"
+
+	// Cooldowns keep alerts to at most roughly once per hour per trigger bucket.
+	intradayCooldownSignificant = 55 * time.Minute
+	intradayCooldownMarginal    = 55 * time.Minute
+	intradayCooldownReversal    = 55 * time.Minute
+	userPriceAlertCooldown      = 55 * time.Minute
+
+	// If an intraday alert already fired recently, suppress nearby price alerts (and vice versa).
+	intradayPriceOverlapSuppression = 70 * time.Minute
+
+	// For price alert re-triggers, require at least a 1% move from the last alerted level.
+	priceAlertRetriggerStepPct = 1.0
+
+	// Reversal rule: stock moved >= 3% from previous close, then retraced by >= 2%.
+	reversalMoveThresholdPct    = 3.0
+	reversalRetraceThresholdPct = 2.0
+)
+
+var (
+	intradayTriggerTypes = []string{"intraday", "intraday_marginal", "intraday_reversal"}
+	priceTriggerTypes    = []string{"price_pct", "price_level"}
 )
 
 // NewsSummariser can summarize headlines for a symbol.
@@ -22,10 +51,13 @@ type NotifyFunc func(chatID int64, html string)
 
 // Scheduler manages the background news fetcher (every 4 hours) and earnings reminders.
 type Scheduler struct {
-	cron      *cron.Cron
-	store     *storage.Store
-	notify    NotifyFunc
+	cron       *cron.Cron
+	store      *storage.Store
+	notify     NotifyFunc
 	summariser NewsSummariser
+
+	intradayRunning  int32
+	userPriceRunning int32
 }
 
 // New creates a new Scheduler. If notify is non-nil, users receive digest messages.
@@ -65,13 +97,11 @@ func (s *Scheduler) Start() error {
 		return err
 	}
 
-	// Intraday alerts: every 15 min during US market hours (14:00-20:59 UTC) Mon-Fri
-	if _, err := s.cron.AddFunc("*/15 14-20 * * 1-5", s.checkIntradayAlerts); err != nil {
+	// Intraday and user-defined alerts: hourly checks during tracked market windows.
+	if err := s.registerMarketAlertSchedules(s.checkIntradayAlerts); err != nil {
 		return err
 	}
-
-	// User-defined price alerts: same schedule as intraday
-	if _, err := s.cron.AddFunc("*/15 14-20 * * 1-5", s.checkUserPriceAlerts); err != nil {
+	if err := s.registerMarketAlertSchedules(s.checkUserPriceAlerts); err != nil {
 		return err
 	}
 
@@ -99,6 +129,18 @@ func (s *Scheduler) Start() error {
 	// Run an initial fetch immediately so the cache isn't empty on startup
 	go s.fetchAllNews()
 
+	return nil
+}
+
+func (s *Scheduler) registerMarketAlertSchedules(job func()) error {
+	for _, spec := range []string{
+		marketAlertSchedulePrimary,
+		marketAlertScheduleOvernight,
+	} {
+		if _, err := s.cron.AddFunc(spec, job); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -264,9 +306,9 @@ func (s *Scheduler) sendEarningsReminders() {
 
 	// chatID -> list of (symbol, quarter) with earnings tomorrow
 	userReminders := make(map[int64][]struct {
-		symbol string
+		symbol  string
 		quarter string
-		date time.Time
+		date    time.Time
 	})
 
 	for _, u := range users {
@@ -287,7 +329,7 @@ func (s *Scheduler) sendEarningsReminders() {
 				userReminders[u.ChatID] = append(userReminders[u.ChatID], struct {
 					symbol  string
 					quarter string
-					date   time.Time
+					date    time.Time
 				}{symbol, info.Quarter, info.EarningsDate})
 			}
 
@@ -383,6 +425,11 @@ Use /start to subscribe (100 Stars/month). /support for help.`
 
 // checkIntradayAlerts checks for intraday 3%, volume 2x, 30d breakout, gap 5% — during US market hours.
 func (s *Scheduler) checkIntradayAlerts() {
+	if !atomic.CompareAndSwapInt32(&s.intradayRunning, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&s.intradayRunning, 0)
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Intraday alerts: PANIC recovered: %v", r)
@@ -423,23 +470,29 @@ func (s *Scheduler) checkIntradayAlerts() {
 		chart1d, _ := yahoo.FetchChart(symbol, "1d", "1m")
 
 		var triggered []string
+		hasMarginal := false
+		hasSignificant := false
+		hasReversal := false
+
 		// Marginal move alert (1-3%): "stock increased marginally"
 		if (q.ChangePercent >= 1 && q.ChangePercent < 3) || (q.ChangePercent <= -1 && q.ChangePercent > -3) {
-			triggered = append(triggered, fmt.Sprintf("%+.1f%% (marginal)", q.ChangePercent))
+			triggered = append(triggered, fmt.Sprintf("Move: %+.1f%% (marginal)", q.ChangePercent))
+			hasMarginal = true
 		}
 		// Significant move (3%+)
 		if q.ChangePercent >= 3 || q.ChangePercent <= -3 {
-			triggered = append(triggered, fmt.Sprintf("%+.1f%%", q.ChangePercent))
+			triggered = append(triggered, fmt.Sprintf("Move: %+.1f%% (significant)", q.ChangePercent))
+			hasSignificant = true
 		}
 		if q.AverageVolume > 0 && q.Volume >= 2*q.AverageVolume {
-			triggered = append(triggered, fmt.Sprintf("Volume %.1fx avg", float64(q.Volume)/float64(q.AverageVolume)))
+			triggered = append(triggered, fmt.Sprintf("Volume: %.1fx average", float64(q.Volume)/float64(q.AverageVolume)))
 		}
 		thirtyHigh := 0.0
 		if chart1mo != nil {
 			thirtyHigh = chart1mo.ThirtyDayHigh()
 		}
 		if thirtyHigh > 0 && q.DayHigh >= thirtyHigh {
-			triggered = append(triggered, "Broke 30d high")
+			triggered = append(triggered, "Breakout: new 30-day high")
 		}
 		gapPct := 0.0
 		if q.PreviousClose > 0 && chart1d != nil && len(chart1d.Candles) > 0 {
@@ -449,29 +502,54 @@ func (s *Scheduler) checkIntradayAlerts() {
 			}
 		}
 		if gapPct >= 5 {
-			triggered = append(triggered, fmt.Sprintf("Gap up %.1f%%", gapPct))
+			triggered = append(triggered, fmt.Sprintf("Open gap: +%.1f%%", gapPct))
+		}
+
+		// Reversal detection: sharp pullback from a strong intraday spike, or bounce from a deep selloff.
+		if q.PreviousClose > 0 {
+			if q.DayHigh > 0 {
+				dayHighPct := (q.DayHigh - q.PreviousClose) / q.PreviousClose * 100
+				retraceFromHigh := dayHighPct - q.ChangePercent
+				if dayHighPct >= reversalMoveThresholdPct && retraceFromHigh >= reversalRetraceThresholdPct {
+					triggered = append(triggered, fmt.Sprintf("Reversal: pulled back %.1f%% from intraday high", retraceFromHigh))
+					hasReversal = true
+				}
+			}
+			if q.DayLow > 0 {
+				dayLowPct := (q.DayLow - q.PreviousClose) / q.PreviousClose * 100
+				reboundFromLow := q.ChangePercent - dayLowPct
+				if dayLowPct <= -reversalMoveThresholdPct && reboundFromLow >= reversalRetraceThresholdPct {
+					triggered = append(triggered, fmt.Sprintf("Reversal: rebounded %.1f%% from intraday low", reboundFromLow))
+					hasReversal = true
+				}
+			}
 		}
 
 		if len(triggered) == 0 {
 			continue
 		}
 
-		line := fmt.Sprintf("<b>%s</b>: %s", symbol, strings.Join(triggered, " | "))
-		// Use separate trigger types: intraday_marginal (1-3%) vs intraday (3%+)
+		line := fmt.Sprintf("<b>%s</b>\nSignals: %s\nPrices: %s", symbol, strings.Join(triggered, "; "), q.SessionPriceSummary())
+		// Separate trigger types + cooldowns for significant, marginal, and reversal updates.
 		triggerType := "intraday"
-		for _, t := range triggered {
-			if strings.Contains(t, "marginal") {
-				triggerType = "intraday_marginal"
-				break
-			}
+		if hasReversal {
+			triggerType = "intraday_reversal"
+		} else if hasSignificant {
+			triggerType = "intraday"
+		} else if hasMarginal {
+			triggerType = "intraday_marginal"
 		}
+		cooldown := intradayAlertCooldown(triggerType)
 
 		for _, chatID := range chatIDs {
 			eligible, _ := s.store.IsEligible(chatID)
 			if !eligible {
 				continue
 			}
-			ok, _ := s.store.WasAlertTriggeredInLast24h(chatID, symbol, triggerType)
+			if s.wasAnyTriggerRecently(chatID, symbol, priceTriggerTypes, intradayPriceOverlapSuppression) {
+				continue
+			}
+			ok, _ := s.store.WasAlertTriggeredWithin(chatID, symbol, triggerType, cooldown)
 			if ok {
 				continue
 			}
@@ -484,7 +562,7 @@ func (s *Scheduler) checkIntradayAlerts() {
 		if len(lines) == 0 {
 			continue
 		}
-		msg := "<b>Intraday alerts</b>\n\n" + strings.Join(lines, "\n")
+		msg := "<b>Intraday alerts</b>\n\n" + strings.Join(lines, "\n\n")
 		s.notify(chatID, msg)
 	}
 
@@ -493,8 +571,13 @@ func (s *Scheduler) checkIntradayAlerts() {
 	}
 }
 
-// checkUserPriceAlerts checks user-defined price alerts (pct or price level) and sends with news + AI summary.
+// checkUserPriceAlerts checks user-defined price alerts (pct or price level) and sends with latest headlines.
 func (s *Scheduler) checkUserPriceAlerts() {
+	if !atomic.CompareAndSwapInt32(&s.userPriceRunning, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&s.userPriceRunning, 0)
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("User price alerts: PANIC recovered: %v", r)
@@ -528,17 +611,16 @@ func (s *Scheduler) checkUserPriceAlerts() {
 			triggered := false
 			triggerType := ""
 			triggerDesc := ""
+			triggerValue := 0.0
 
 			switch a.Type {
 			case "pct":
-				absPct := q.ChangePercent
-				if absPct < 0 {
-					absPct = -absPct
-				}
+				absPct := math.Abs(q.ChangePercent)
 				if absPct >= a.Threshold {
 					triggered = true
 					triggerType = "price_pct"
 					triggerDesc = fmt.Sprintf("%+.1f%%", q.ChangePercent)
+					triggerValue = q.ChangePercent
 				}
 			case "price":
 				// Alert when price crosses threshold (up or down)
@@ -546,6 +628,7 @@ func (s *Scheduler) checkUserPriceAlerts() {
 					triggered = true
 					triggerType = "price_level"
 					triggerDesc = fmt.Sprintf("$%.2f", q.RegularMarketPrice)
+					triggerValue = q.RegularMarketPrice
 				}
 			}
 
@@ -557,36 +640,36 @@ func (s *Scheduler) checkUserPriceAlerts() {
 			if !eligible {
 				continue
 			}
-			ok, _ := s.store.WasAlertTriggeredInLast24h(a.ChatID, symbol, triggerType)
+			if s.wasAnyTriggerRecently(a.ChatID, symbol, intradayTriggerTypes, intradayPriceOverlapSuppression) {
+				continue
+			}
+			cooldown := s.store.GetAlertCooldown(a.ChatID)
+			ok, _ := s.store.WasAlertTriggeredWithin(a.ChatID, symbol, triggerType, cooldown)
 			if ok {
 				continue
 			}
-
-			// Build message with news + AI summary
-			articles := s.store.GetLatestArticles(a.ChatID, symbol, 5)
-			headlines := make([]string, 0, len(articles))
-			for _, art := range articles {
-				headlines = append(headlines, art.Title)
+			if !s.movedEnoughSinceLastTrigger(a.ChatID, symbol, triggerType, triggerValue, a.Type) {
+				continue
 			}
+
+			// Build message with latest headlines.
+			articles := s.store.GetLatestArticles(a.ChatID, symbol, 5)
 
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("<b>%s %s</b> — Price alert triggered\n\n", symbol, triggerDesc))
+			sb.WriteString(fmt.Sprintf("<b>%s %s</b> — Price alert triggered\n", symbol, triggerDesc))
+			sb.WriteString(fmt.Sprintf("<b>Prices:</b> %s\n\n", q.SessionPriceSummary()))
 			sb.WriteString("<b>Latest:</b>\n")
-			for i := 0; i < len(articles) && i < 3; i++ {
-				art := articles[i]
-				sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", art.Link, escapeHTML(art.Title)))
-			}
-			if s.summariser != nil && len(headlines) > 0 {
-				summary, err := s.summariser.SummarizeHeadlines(symbol, headlines)
-				if err == nil {
-					sb.WriteString("\n<b>AI summary:</b> ")
-					sb.WriteString(escapeHTML(summary))
+			if len(articles) == 0 {
+				sb.WriteString("• No fresh headlines cached yet.\n")
+			} else {
+				for i := 0; i < len(articles) && i < 3; i++ {
+					art := articles[i]
+					sb.WriteString(fmt.Sprintf("• <a href=\"%s\">%s</a>\n", art.Link, escapeHTML(art.Title)))
 				}
-				time.Sleep(300 * time.Millisecond)
 			}
 
 			s.notify(a.ChatID, sb.String())
-			_ = s.store.RecordAlertTrigger(a.ChatID, symbol, triggerType)
+			_ = s.store.RecordAlertTriggerValue(a.ChatID, symbol, triggerType, &triggerValue)
 		}
 	}
 }
@@ -622,13 +705,13 @@ func (s *Scheduler) sendMorningSnapshot() {
 
 		type premarketMove struct {
 			symbol string
-			pct   float64
+			pct    float64
 		}
 		var moves []premarketMove
+		quotes := make(map[string]*yahoo.QuoteExtended, len(u.Symbols))
 		var regularSnapshot []struct {
 			symbol string
-			price  float64
-			pct    float64
+			quote  *yahoo.QuoteExtended
 		}
 		var earningsToday []string
 
@@ -639,6 +722,7 @@ func (s *Scheduler) sendMorningSnapshot() {
 				time.Sleep(300 * time.Millisecond)
 				continue
 			}
+			quotes[symbol] = q
 			time.Sleep(200 * time.Millisecond)
 
 			if q.PreMarketPrice > 0 && q.PreviousClose > 0 {
@@ -648,9 +732,8 @@ func (s *Scheduler) sendMorningSnapshot() {
 				// No premarket data — use regular session for overview
 				regularSnapshot = append(regularSnapshot, struct {
 					symbol string
-					price  float64
-					pct    float64
-				}{symbol, q.RegularMarketPrice, q.ChangePercent})
+					quote  *yahoo.QuoteExtended
+				}{symbol, q})
 			}
 
 			info, err := yahoo.FetchEarnings(symbol)
@@ -694,18 +777,30 @@ func (s *Scheduler) sendMorningSnapshot() {
 					biggestAbs = m
 				}
 			}
-			sb.WriteString(fmt.Sprintf("• Top gainer: <b>%s</b> %+.1f%%\n", topGain.symbol, topGain.pct))
-			sb.WriteString(fmt.Sprintf("• Top loser: <b>%s</b> %+.1f%%\n", topLose.symbol, topLose.pct))
-			sb.WriteString(fmt.Sprintf("• Biggest move: <b>%s</b> %+.1f%%\n", biggestAbs.symbol, biggestAbs.pct))
+			sb.WriteString(fmt.Sprintf("• Top gainer: <b>%s</b> %+.1f%%", topGain.symbol, topGain.pct))
+			if q := quotes[topGain.symbol]; q != nil {
+				sb.WriteString(fmt.Sprintf(" (%s)", q.SessionPriceSummary()))
+			}
+			sb.WriteString("\n")
+			sb.WriteString(fmt.Sprintf("• Top loser: <b>%s</b> %+.1f%%", topLose.symbol, topLose.pct))
+			if q := quotes[topLose.symbol]; q != nil {
+				sb.WriteString(fmt.Sprintf(" (%s)", q.SessionPriceSummary()))
+			}
+			sb.WriteString("\n")
+			sb.WriteString(fmt.Sprintf("• Biggest move: <b>%s</b> %+.1f%%", biggestAbs.symbol, biggestAbs.pct))
+			if q := quotes[biggestAbs.symbol]; q != nil {
+				sb.WriteString(fmt.Sprintf(" (%s)", q.SessionPriceSummary()))
+			}
+			sb.WriteString("\n")
 		}
 		if len(earningsToday) > 0 {
 			sb.WriteString(fmt.Sprintf("\n• Earnings today: %s\n", strings.Join(earningsToday, ", ")))
 		}
-		// Include regular market snapshot when no premarket or as supplement
+		// Include snapshot for symbols without premarket data (e.g. non-US or stale premarket quote).
 		if len(regularSnapshot) > 0 {
 			sb.WriteString("\n")
 			for _, r := range regularSnapshot {
-				sb.WriteString(fmt.Sprintf("• <b>%s</b> $%.2f %+.1f%%\n", r.symbol, r.price, r.pct))
+				sb.WriteString(fmt.Sprintf("• <b>%s</b> %s\n", r.symbol, r.quote.SessionPriceSummary()))
 			}
 		}
 
@@ -767,7 +862,7 @@ func (s *Scheduler) checkAfterHoursAlerts() {
 			if ok {
 				continue
 			}
-			userAlerts[chatID] = append(userAlerts[chatID], fmt.Sprintf("<b>%s</b> %+.1f%%", symbol, movePct))
+			userAlerts[chatID] = append(userAlerts[chatID], fmt.Sprintf("<b>%s</b> %+.1f%% (%s)", symbol, movePct, q.SessionPriceSummary()))
 			_ = s.store.RecordAlertTrigger(chatID, symbol, "afterhours_5pct")
 		}
 	}
@@ -816,7 +911,7 @@ func (s *Scheduler) sendWeeklyRecap() {
 
 		type perf struct {
 			symbol string
-			pct   float64
+			pct    float64
 		}
 		var perfs []perf
 
@@ -1000,4 +1095,43 @@ func (s *Scheduler) buildDigest(chatID int64, symbolArticles map[string][]storag
 func escapeHTML(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return r.Replace(s)
+}
+
+func (s *Scheduler) wasAnyTriggerRecently(chatID int64, symbol string, triggerTypes []string, within time.Duration) bool {
+	for _, tt := range triggerTypes {
+		ok, err := s.store.WasAlertTriggeredWithin(chatID, symbol, tt, within)
+		if err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) movedEnoughSinceLastTrigger(chatID int64, symbol, triggerType string, currentValue float64, alertType string) bool {
+	lastValue, hasLast, err := s.store.GetAlertTriggerValue(chatID, symbol, triggerType)
+	if err != nil || !hasLast {
+		return true
+	}
+
+	switch alertType {
+	case "price":
+		if lastValue == 0 {
+			return true
+		}
+		movePct := math.Abs((currentValue - lastValue) / lastValue * 100)
+		return movePct >= priceAlertRetriggerStepPct
+	default: // "pct"
+		return math.Abs(currentValue-lastValue) >= priceAlertRetriggerStepPct
+	}
+}
+
+func intradayAlertCooldown(triggerType string) time.Duration {
+	switch triggerType {
+	case "intraday_marginal":
+		return intradayCooldownMarginal
+	case "intraday_reversal":
+		return intradayCooldownReversal
+	default:
+		return intradayCooldownSignificant
+	}
 }

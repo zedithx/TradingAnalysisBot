@@ -87,6 +87,9 @@ func (s *Store) ensureAlertTriggersTable(ctx context.Context) {
 	if err != nil {
 		log.Printf("ensureAlertTriggersTable: %v", err)
 	}
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS trigger_value DOUBLE PRECISION`); err != nil {
+		log.Printf("ensureAlertTriggersTable add trigger_value: %v", err)
+	}
 }
 
 // ensureSwingTraderTables creates user_preferences, price_alerts, earnings_reminders, digest_article_state.
@@ -95,6 +98,7 @@ func (s *Store) ensureSwingTraderTables(ctx context.Context) {
 		`CREATE TABLE IF NOT EXISTS user_preferences (
 			chat_id BIGINT PRIMARY KEY REFERENCES users(chat_id) ON DELETE CASCADE,
 			digest_frequency_hours INT DEFAULT 4,
+			alert_frequency_hours INT DEFAULT 2,
 			dnd_start_utc TIME,
 			dnd_end_utc TIME,
 			timezone TEXT,
@@ -137,30 +141,75 @@ func (s *Store) ensureSwingTraderTables(ctx context.Context) {
 			log.Printf("ensureSwingTraderTables: %v", err)
 		}
 	}
+	// Migrate: add alert_frequency_hours column if missing.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS alert_frequency_hours INT DEFAULT 2`); err != nil {
+		log.Printf("ensureSwingTraderTables add alert_frequency_hours: %v", err)
+	}
 }
 
 // RecordAlertTrigger upserts the alert trigger timestamp for deduplication.
 func (s *Store) RecordAlertTrigger(chatID int64, symbol, triggerType string) error {
+	return s.RecordAlertTriggerValue(chatID, symbol, triggerType, nil)
+}
+
+// RecordAlertTriggerValue upserts the alert trigger timestamp and optional value for deduplication and re-trigger logic.
+func (s *Store) RecordAlertTriggerValue(chatID int64, symbol, triggerType string, triggerValue *float64) error {
 	_, err := s.pool.Exec(context.Background(),
-		`INSERT INTO alert_triggers (chat_id, symbol, trigger_type, triggered_at)
-		 VALUES ($1, $2, $3, NOW())
+		`INSERT INTO alert_triggers (chat_id, symbol, trigger_type, triggered_at, trigger_value)
+		 VALUES ($1, $2, $3, NOW(), $4)
 		 ON CONFLICT (chat_id, symbol, trigger_type)
-		 DO UPDATE SET triggered_at = NOW()`,
-		chatID, symbol, triggerType)
+		 DO UPDATE SET triggered_at = NOW(), trigger_value = EXCLUDED.trigger_value`,
+		chatID, symbol, triggerType, triggerValue)
 	return err
+}
+
+// GetAlertTriggerValue returns the last recorded trigger value for an alert trigger.
+func (s *Store) GetAlertTriggerValue(chatID int64, symbol, triggerType string) (float64, bool, error) {
+	var triggerValue *float64
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT trigger_value
+		 FROM alert_triggers
+		 WHERE chat_id = $1 AND symbol = $2 AND trigger_type = $3`,
+		chatID, symbol, triggerType,
+	).Scan(&triggerValue)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if triggerValue == nil {
+		return 0, false, nil
+	}
+	return *triggerValue, true, nil
+}
+
+// WasAlertTriggeredWithin returns true if this alert was triggered within the given duration.
+func (s *Store) WasAlertTriggeredWithin(chatID int64, symbol, triggerType string, within time.Duration) (bool, error) {
+	if within <= 0 {
+		return false, nil
+	}
+
+	var triggeredAt time.Time
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT triggered_at
+		 FROM alert_triggers
+		 WHERE chat_id = $1 AND symbol = $2 AND trigger_type = $3`,
+		chatID, symbol, triggerType,
+	).Scan(&triggeredAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return time.Since(triggeredAt.UTC()) < within, nil
 }
 
 // WasAlertTriggeredInLast24h returns true if this alert was triggered in the last 24 hours.
 func (s *Store) WasAlertTriggeredInLast24h(chatID int64, symbol, triggerType string) (bool, error) {
-	var ok bool
-	err := s.pool.QueryRow(context.Background(),
-		`SELECT EXISTS(
-		 SELECT 1 FROM alert_triggers
-		 WHERE chat_id = $1 AND symbol = $2 AND trigger_type = $3
-		 AND triggered_at > NOW() - INTERVAL '24 hours'
-		)`,
-		chatID, symbol, triggerType).Scan(&ok)
-	return ok, err
+	return s.WasAlertTriggeredWithin(chatID, symbol, triggerType, 24*time.Hour)
 }
 
 // Close releases the connection pool.
@@ -279,10 +328,10 @@ func (s *Store) ExtendSlotsExpansion(chatID int64) error {
 
 // TrialReminderCandidate holds user data for trial reminder decisions.
 type TrialReminderCandidate struct {
-	ChatID           int64
-	FirstUsedAt      time.Time
-	Reminder5dSent   bool
-	Reminder1dSent   bool
+	ChatID              int64
+	FirstUsedAt         time.Time
+	Reminder5dSent      bool
+	Reminder1dSent      bool
 	ReminderExpiredSent bool
 }
 
@@ -628,31 +677,32 @@ func (s *Store) PruneOldArticles() error {
 	return nil
 }
 
-// UserPreferences holds digest and DND settings.
+// UserPreferences holds digest, alert, and DND settings.
 type UserPreferences struct {
 	ChatID               int64
-	DigestFrequencyHours int       // 2, 4, 8, or 24
+	DigestFrequencyHours int // 2, 4, 8, or 24
+	AlertFrequencyHours  int // 1, 2, 4, or 8 — how often price alerts can fire
 	DNDStartUTC          *time.Time
 	DNDEndUTC            *time.Time
 	Timezone             string
 	LastDigestSentAt     *time.Time
 }
 
-// GetPreferences returns user preferences, or defaults (4h digest) if none.
+// GetPreferences returns user preferences, or defaults (4h digest, 2h alerts) if none.
 func (s *Store) GetPreferences(chatID int64) (*UserPreferences, error) {
 	ctx := context.Background()
 	var p UserPreferences
 	var dndStart, dndEnd interface{}
 	var lastSent interface{}
 	err := s.pool.QueryRow(ctx,
-		`SELECT chat_id, COALESCE(digest_frequency_hours, 4), dnd_start_utc, dnd_end_utc,
+		`SELECT chat_id, COALESCE(digest_frequency_hours, 4), COALESCE(alert_frequency_hours, 2), dnd_start_utc, dnd_end_utc,
 		 COALESCE(timezone, ''), last_digest_sent_at
 		 FROM user_preferences WHERE chat_id = $1`,
 		chatID,
-	).Scan(&p.ChatID, &p.DigestFrequencyHours, &dndStart, &dndEnd, &p.Timezone, &lastSent)
+	).Scan(&p.ChatID, &p.DigestFrequencyHours, &p.AlertFrequencyHours, &dndStart, &dndEnd, &p.Timezone, &lastSent)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return &UserPreferences{ChatID: chatID, DigestFrequencyHours: 4}, nil
+			return &UserPreferences{ChatID: chatID, DigestFrequencyHours: 4, AlertFrequencyHours: 2}, nil
 		}
 		return nil, err
 	}
@@ -710,6 +760,33 @@ func (s *Store) SetDigestFrequency(chatID int64, hours int) error {
 		chatID, hours,
 	)
 	return err
+}
+
+// SetAlertFrequency sets price alert frequency (1, 2, 4, or 8 hours).
+func (s *Store) SetAlertFrequency(chatID int64, hours int) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	if hours != 1 && hours != 2 && hours != 4 && hours != 8 {
+		hours = 2
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_preferences (chat_id, alert_frequency_hours, updated_at)
+		 VALUES ($1, $2, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET alert_frequency_hours = $2, updated_at = NOW()`,
+		chatID, hours,
+	)
+	return err
+}
+
+// GetAlertCooldown returns the per-user price alert cooldown duration.
+func (s *Store) GetAlertCooldown(chatID int64) time.Duration {
+	prefs, err := s.GetPreferences(chatID)
+	if err != nil || prefs.AlertFrequencyHours <= 0 {
+		return 2 * time.Hour
+	}
+	return time.Duration(prefs.AlertFrequencyHours)*time.Hour - 5*time.Minute // subtract 5min for scheduling jitter
 }
 
 // SetLastDigestSentAt records when the last digest was sent.

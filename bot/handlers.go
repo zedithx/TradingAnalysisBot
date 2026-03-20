@@ -3,6 +3,8 @@ package bot
 import (
 	"fmt"
 	"log"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -139,66 +141,109 @@ First 30 days are free, then 100 Stars/month.
 
 Start by adding a few stocks: /add, then reply with a ticker (like AAPL) or send a screenshot of your watchlist — I'll pull the symbols out. You can add up to 10. /list shows what you're tracking.
 
-Then: /news for headlines, /reports for earnings dates, /analyse for AI summaries. /help has the full list.
+Then: /news for headlines, /reports for earnings dates, /analyse for stock deep-dives, /ask for market Q&A. /help has the full list.
 
 /support for payment help. (Info only — not financial advice.)`
-	b.sendText(chatID, welcome)
+	welcomeMsg := tgbotapi.NewMessage(chatID, welcome)
+	welcomeMsg.ReplyMarkup = persistentKeyboard()
+	if _, err := b.API.Send(welcomeMsg); err != nil {
+		log.Printf("Error sending welcome to %d: %v", chatID, err)
+	}
 }
 
-// handleHelp lists all available commands.
-func (b *Bot) handleHelp(msg *tgbotapi.Message) {
-	text := `-- SUBSCRIPTION --
-First 30 days free, then 100 Stars/month. /support for payment questions.
+// helpOverviewText is the main /help menu text.
+const helpOverviewText = `Choose a topic to learn more:
 
--- HOW TO USE --
+First 30 days free, then 100 Stars/month.
+/support for payment questions.`
 
-1. BUILD YOUR WATCHLIST
+// helpSections maps callback data keys to help section content.
+var helpSections = map[string]string{
+	"watchlist": `<b>Build Your Watchlist</b>
+
 /add - Reply with ticker or send a photo of your watchlist
 /add SYMBOL - Track a stock (e.g. /add AAPL)
 /remove SYMBOL - Stop tracking a stock
 /list - View your current watchlist
 
-2. MONITOR NEWS & SENTIMENT
-/news - Latest 10 headlines across your watchlist
-/news SYMBOL - Latest 10 headlines for any stock
-
-News headlines are one of the most important tools for gauging market sentiment. When significant negative news breaks (lawsuits, missed guidance, regulatory action), it often drives selling pressure. Conversely, positive catalysts (strong partnerships, product launches, analyst upgrades) can signal buying momentum. Use /news regularly to stay ahead of price-moving events.
-
-3. TRACK EARNINGS DATES
-/reports - Next earnings report dates for your watchlist
-
-Earnings reports (Q1, Q2, Q3, Q4) are when companies publish their financial statements, including revenue, net income, expenses, and forward guidance. These are critical dates for any investor. Strong earnings can validate a company's growth trajectory, while misses can trigger sharp sell-offs. Knowing when reports are due helps you prepare for potential volatility and make informed decisions around those dates.
-
-4. LIVE PRICE
-/price SYMBOL - Live price, % change, pre/post market, day range, volume
-/price - Reply with symbol or "all" for watchlist
-
-5. AI ANALYSIS
-/analyse SYMBOL - AI-powered analysis for a specific stock
-/analyse - AI analysis for all your watchlist stocks
-
-Consolidates recent news, live price data, and earnings information, then uses AI to provide a sentiment summary, key risk factors, and a short-term outlook.
-
-6. PRICE ALERTS
-/alerts - View or add custom price alerts
-/alerts AAPL 5% - Alert when AAPL moves ±5%
-/alerts AAPL 150 - Alert when AAPL hits $150
-
-7. SETTINGS
-/settings - Digest frequency (2h/4h/8h/24h)
-
--- TIPS --
 Use exchange suffixes for non-US stocks:
   005930.KS (Samsung, Korea)
   0700.HK (Tencent, Hong Kong)
-  D05.SI (DBS, Singapore)
+  D05.SI (DBS, Singapore)`,
 
-/support — Payment or subscription issues
-/terms — Terms and conditions
+	"news": `<b>News &amp; Sentiment</b>
 
-DISCLAIMER: This bot is for informational and educational purposes only. Nothing provided here constitutes financial advice, investment recommendations, or a solicitation to buy or sell any securities. The creators and operators of this bot are not licensed financial advisors and are not responsible for any investment decisions or losses incurred based on information provided. Always do your own research and consult a qualified financial professional before making any investment decisions.`
+/news - Latest 10 headlines across your watchlist
+/news SYMBOL - Latest 10 headlines for any stock
 
-	b.sendText(msg.Chat.ID, text)
+News headlines are one of the most important tools for gauging market sentiment. Negative news (lawsuits, missed guidance, regulatory action) often drives selling pressure. Positive catalysts (partnerships, product launches, analyst upgrades) can signal buying momentum. Use /news regularly to stay ahead of price-moving events.`,
+
+	"earnings": `<b>Earnings Dates</b>
+
+/reports - Next earnings report dates for your watchlist
+
+Earnings reports (Q1–Q4) are when companies publish financials — revenue, net income, expenses, and guidance. Strong earnings validate growth; misses can trigger sharp sell-offs. Knowing report dates helps you prepare for volatility.`,
+
+	"price": `<b>Live Price</b>
+
+/price SYMBOL - Live price, % change, pre/post market, day range, volume
+/price - Reply with symbol or "all" for your whole watchlist`,
+
+	"analysis": `<b>AI Analysis</b>
+
+/analyse SYMBOL - AI-powered analysis for a specific stock
+/analyse - AI analysis for all your watchlist stocks
+
+Consolidates recent news, live price data, and earnings info, then uses AI to provide a sentiment summary, key risk factors, and a short-term outlook.
+
+<b>Market Q&amp;A</b>
+
+/ask QUESTION - Ask anything market-related
+/ask - Reply with your question
+
+Uses current market context (headlines, index snapshots, watchlist data) to generate a structured answer.`,
+
+	"alerts": `<b>Price Alerts</b>
+
+/alerts - View, add, or remove price alerts
+/alerts AAPL 5% - Alert when AAPL moves ±5% from previous close
+/alerts AAPL 150 - Alert when AAPL hits $150
+
+Set per-stock thresholds to get notified when a price target or percentage move is hit. Alerts are checked during market hours — control how often they fire in /configure.`,
+
+	"settings": `<b>Settings</b>
+
+/configure - All-in-one settings: digest frequency, alert frequency, DND, manage alerts
+/settings - Same as /configure
+
+Set how often news digests are sent (2h/4h/8h/24h), how often price alerts are checked (1h/2h/4h/8h), set a Do Not Disturb window, and manage your per-stock price alerts.`,
+}
+
+// helpKeyboard returns the inline keyboard for the /help overview.
+func helpKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Watchlist", "help:watchlist"),
+			tgbotapi.NewInlineKeyboardButtonData("News", "help:news"),
+			tgbotapi.NewInlineKeyboardButtonData("Earnings", "help:earnings"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Price", "help:price"),
+			tgbotapi.NewInlineKeyboardButtonData("AI Analysis", "help:analysis"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Price Alerts", "help:alerts"),
+			tgbotapi.NewInlineKeyboardButtonData("Settings", "help:settings"),
+		),
+	)
+}
+
+// handleHelp sends the interactive help menu.
+func (b *Bot) handleHelp(msg *tgbotapi.Message) {
+	kb := helpKeyboard()
+	out := tgbotapi.NewMessage(msg.Chat.ID, helpOverviewText)
+	out.ReplyMarkup = kb
+	b.API.Send(out)
 }
 
 // handleAdd validates and adds a stock symbol to the user's watchlist.
@@ -394,7 +439,7 @@ func (b *Bot) doRemove(chatID int64, symbol string) {
 	b.sendText(chatID, fmt.Sprintf("Removed %s from your watchlist.", symbol))
 }
 
-// handlePendingSymbol processes a reply after /add, /remove, /news, or /analyse was sent without arguments.
+// handlePendingSymbol processes a reply after commands that request follow-up input (/add, /remove, /news, /price, /alerts, /analyse, /ask).
 func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 	switch action {
 	case pendingAdd:
@@ -427,6 +472,8 @@ func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 			return
 		}
 		b.doAnalyse(chatID, userID, text)
+	case pendingAsk:
+		b.doAsk(chatID, text)
 	}
 }
 
@@ -598,8 +645,7 @@ func (b *Bot) doPrice(chatID int64, arg string) {
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
-		pctStr := fmt.Sprintf("%+.1f%%", q.ChangePercent)
-		lines = append(lines, fmt.Sprintf("• <b>%s</b> $%.2f %s", symbol, q.RegularMarketPrice, pctStr))
+		lines = append(lines, fmt.Sprintf("• <b>%s</b> %s", symbol, q.SessionPriceSummary()))
 		time.Sleep(300 * time.Millisecond)
 	}
 
@@ -614,20 +660,28 @@ func formatPriceSingle(q *yahoo.QuoteExtended) string {
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("<b>%s</b>  $%.2f  <b>%s</b>\n\n", q.Symbol, q.RegularMarketPrice, pctStr))
-	sb.WriteString(fmt.Sprintf("Regular: $%.2f (%s)  |  Prev close $%.2f\n", q.RegularMarketPrice, pctStr, q.PreviousClose))
+	sb.WriteString(fmt.Sprintf("Regular session: $%.2f (%s)  |  Prev close $%.2f\n", q.RegularMarketPrice, pctStr, q.PreviousClose))
 	if q.DayHigh > 0 && q.DayLow > 0 {
 		sb.WriteString(fmt.Sprintf("Day range: $%.2f – $%.2f  |  Vol: %s\n", q.DayLow, q.DayHigh, volStr))
 	} else {
 		sb.WriteString(fmt.Sprintf("Vol: %s\n", volStr))
 	}
 
-	if q.PreMarketPrice > 0 && q.PreviousClose > 0 {
-		pmPct := (q.PreMarketPrice - q.PreviousClose) / q.PreviousClose * 100
-		sb.WriteString(fmt.Sprintf("\nPre-mkt: $%.2f (%+.1f%%)\n", q.PreMarketPrice, pmPct))
+	if q.PreMarketPrice > 0 {
+		if q.PreviousClose > 0 {
+			pmPct := (q.PreMarketPrice - q.PreviousClose) / q.PreviousClose * 100
+			sb.WriteString(fmt.Sprintf("\nPre-market: $%.2f (%+.1f%%)\n", q.PreMarketPrice, pmPct))
+		} else {
+			sb.WriteString(fmt.Sprintf("\nPre-market: $%.2f\n", q.PreMarketPrice))
+		}
 	}
-	if q.PostMarketPrice > 0 && q.PreviousClose > 0 {
-		ahPct := (q.PostMarketPrice - q.PreviousClose) / q.PreviousClose * 100
-		sb.WriteString(fmt.Sprintf("Post-mkt: $%.2f (%+.1f%%)\n", q.PostMarketPrice, ahPct))
+	if q.PostMarketPrice > 0 {
+		if q.PreviousClose > 0 {
+			ahPct := (q.PostMarketPrice - q.PreviousClose) / q.PreviousClose * 100
+			sb.WriteString(fmt.Sprintf("Post-market: $%.2f (%+.1f%%)\n", q.PostMarketPrice, ahPct))
+		} else {
+			sb.WriteString(fmt.Sprintf("Post-market: $%.2f\n", q.PostMarketPrice))
+		}
 	}
 
 	return sb.String()
@@ -674,6 +728,9 @@ func (b *Bot) handleAlerts(msg *tgbotapi.Message) {
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("Add alert", "alerts:add"),
 			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Back to settings", "alerts:back"),
+			),
 		)
 		msg := tgbotapi.NewMessage(chatID, "No price alerts set.\n\nAdd one: <code>/alerts AAPL 5%</code> or <code>/alerts AAPL 150</code> (price level)")
 		msg.ReplyMarkup = kb
@@ -699,6 +756,9 @@ func (b *Bot) handleAlerts(msg *tgbotapi.Message) {
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("Add alert", "alerts:add"),
+	))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Back to settings", "alerts:back"),
 	))
 
 	bm := tgbotapi.NewMessage(chatID, sb.String())
@@ -792,20 +852,38 @@ func (b *Bot) handleSetDND(chatID int64, text string) {
 	b.sendText(chatID, fmt.Sprintf("DND set: %02d:%02d - %02d:%02d UTC", h1, m1, h2, m2))
 }
 
-// handleSettings shows digest frequency and DND options (Phase 4).
+// handleSettings is an alias for handleConfigure.
 func (b *Bot) handleSettings(msg *tgbotapi.Message) {
+	b.handleConfigure(msg)
+}
+
+// handleConfigure shows a unified settings menu: digest frequency, alert frequency, DND, and manage alerts.
+func (b *Bot) handleConfigure(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	prefs, _ := b.Store.GetPreferences(chatID)
 	freq := 4
+	alertFreq := 2
 	dndStr := "Off"
 	if prefs != nil {
 		freq = prefs.DigestFrequencyHours
+		if prefs.AlertFrequencyHours > 0 {
+			alertFreq = prefs.AlertFrequencyHours
+		}
 		if prefs.DNDStartUTC != nil && prefs.DNDEndUTC != nil {
 			dndStr = fmt.Sprintf("%02d:%02d - %02d:%02d UTC",
 				prefs.DNDStartUTC.Hour(), prefs.DNDStartUTC.Minute(),
 				prefs.DNDEndUTC.Hour(), prefs.DNDEndUTC.Minute())
 		}
 	}
+
+	// Count active price alerts for display.
+	alertCount := 0
+	if alerts, err := b.Store.GetPriceAlerts(chatID); err == nil {
+		alertCount = len(alerts)
+	}
+
+	alertLabel := fmt.Sprintf("Manage price alerts (%d active)", alertCount)
+
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("2h", "settings:digest:2"),
@@ -814,11 +892,27 @@ func (b *Bot) handleSettings(msg *tgbotapi.Message) {
 			tgbotapi.NewInlineKeyboardButtonData("24h", "settings:digest:24"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("1h", "settings:alert:1"),
+			tgbotapi.NewInlineKeyboardButtonData("2h", "settings:alert:2"),
+			tgbotapi.NewInlineKeyboardButtonData("4h", "settings:alert:4"),
+			tgbotapi.NewInlineKeyboardButtonData("8h", "settings:alert:8"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(alertLabel, "settings:manage_alerts"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Set DND", "settings:dnd"),
 			tgbotapi.NewInlineKeyboardButtonData("Clear DND", "settings:dnd:clear"),
 		),
 	)
-	msgOut := tgbotapi.NewMessage(chatID, fmt.Sprintf("Digest: every %dh\nDND: %s\n\nTap to change:", freq, dndStr))
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("News digest: every %dh\n", freq))
+	sb.WriteString(fmt.Sprintf("Price alerts: check every %dh (%d active)\n", alertFreq, alertCount))
+	sb.WriteString(fmt.Sprintf("DND: %s\n", dndStr))
+	sb.WriteString("\nTap to change:")
+
+	msgOut := tgbotapi.NewMessage(chatID, sb.String())
 	msgOut.ReplyMarkup = kb
 	b.API.Send(msgOut)
 }
@@ -846,6 +940,26 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 
 	parts := strings.SplitN(data, ":", 2)
 	switch {
+	case len(parts) >= 2 && parts[0] == "help" && parts[1] == "back":
+		// Edit message back to help overview.
+		edit := tgbotapi.NewEditMessageText(chatID, cq.Message.MessageID, helpOverviewText)
+		kb := helpKeyboard()
+		edit.ReplyMarkup = &kb
+		b.API.Send(edit)
+	case len(parts) >= 2 && parts[0] == "help":
+		section, ok := helpSections[parts[1]]
+		if !ok {
+			return
+		}
+		backKb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("« Back", "help:back"),
+			),
+		)
+		edit := tgbotapi.NewEditMessageText(chatID, cq.Message.MessageID, section)
+		edit.ParseMode = tgbotapi.ModeHTML
+		edit.ReplyMarkup = &backKb
+		b.API.Send(edit)
 	case len(parts) >= 2 && parts[0] == "reports" && parts[1] == "upcoming":
 		b.handleReportsUpcoming(chatID)
 	case len(parts) >= 2 && strings.HasPrefix(parts[1], "remind:"):
@@ -892,6 +1006,8 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		b.pendingUserID[chatID] = userID
 		b.pendingMu.Unlock()
 		b.sendText(chatID, "Type the symbol (e.g. AAPL).")
+	case len(parts) >= 2 && parts[0] == "alerts" && parts[1] == "back":
+		b.handleConfigure(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})
 	case len(parts) >= 2 && parts[0] == "alerts" && parts[1] == "add":
 		b.pendingMu.Lock()
 		b.pendingAction[chatID] = pendingAlerts
@@ -916,6 +1032,14 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			_ = b.Store.SetDigestFrequency(chatID, h)
 			b.sendText(chatID, fmt.Sprintf("Digest frequency set to every %d hours.", h))
 		}
+	case len(parts) >= 2 && strings.HasPrefix(parts[1], "alert:"):
+		sub := strings.TrimPrefix(parts[1], "alert:")
+		if h, err := strconv.Atoi(sub); err == nil && (h == 1 || h == 2 || h == 4 || h == 8) {
+			_ = b.Store.SetAlertFrequency(chatID, h)
+			b.sendText(chatID, fmt.Sprintf("Price alert frequency set to every %d hour(s).", h))
+		}
+	case len(parts) >= 2 && parts[1] == "manage_alerts":
+		b.handleAlerts(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})
 	case len(parts) >= 2 && parts[1] == "dnd":
 		b.pendingMu.Lock()
 		b.pendingAction[chatID] = pendingDND
@@ -957,8 +1081,8 @@ func (b *Bot) handleReportsUpcoming(chatID int64) {
 	now := time.Now().UTC()
 	weekEnd := now.Add(7 * 24 * time.Hour)
 	var thisWeek, later []struct {
-		symbol string
-		date   time.Time
+		symbol  string
+		date    time.Time
 		quarter string
 	}
 
@@ -1032,6 +1156,235 @@ func (b *Bot) handleReportsUpcoming(chatID int64) {
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 	b.API.Send(msg)
+}
+
+// handleAsk answers market-related questions using fresh market context + AI.
+func (b *Bot) handleAsk(msg *tgbotapi.Message) {
+	question := strings.TrimSpace(msg.CommandArguments())
+	if question == "" {
+		b.pendingMu.Lock()
+		b.pendingAction[msg.Chat.ID] = pendingAsk
+		if msg.From != nil {
+			b.pendingUserID[msg.Chat.ID] = msg.From.ID
+		}
+		b.pendingMu.Unlock()
+		b.sendText(msg.Chat.ID, "Ask me anything market-related. Example: /ask Why are semis weak today and what levels matter for NVDA?")
+		return
+	}
+
+	b.doAsk(msg.Chat.ID, question)
+}
+
+func (b *Bot) doAsk(chatID int64, question string) {
+	question = strings.TrimSpace(question)
+	if question == "" {
+		b.sendText(chatID, "Please send a market-related question after /ask.")
+		return
+	}
+	if b.Analyser == nil {
+		b.sendText(chatID, "AI market Q&A is currently unavailable.")
+		return
+	}
+
+	b.sendText(chatID, "Working on it...")
+	contextBlock := b.buildAskContext(chatID, question)
+	answer, err := b.Analyser.AskMarket(question, contextBlock)
+	if err != nil {
+		log.Printf("AskMarket error: %v", err)
+		b.sendText(chatID, "I couldn't generate an answer right now. Please try again in a moment.")
+		return
+	}
+	b.sendText(chatID, answer)
+}
+
+func (b *Bot) buildAskContext(chatID int64, question string) string {
+	now := time.Now().UTC()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Generated at: %s UTC\n", now.Format("2006-01-02 15:04")))
+
+	// Broad market snapshot from liquid US proxies.
+	sb.WriteString("\n[MARKET SNAPSHOT]\n")
+	for _, symbol := range []string{"SPY", "QQQ", "DIA", "IWM", "^VIX"} {
+		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+		if err != nil {
+			log.Printf("buildAskContext quote %s: %v", symbol, err)
+			time.Sleep(120 * time.Millisecond)
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
+		time.Sleep(120 * time.Millisecond)
+	}
+
+	// Fresh macro/market headlines.
+	type headline struct {
+		symbol    string
+		title     string
+		published time.Time
+	}
+	var macro []headline
+	for _, symbol := range []string{"SPY", "QQQ", "^GSPC"} {
+		articles, err := yahoo.FetchRecentNews(symbol, 18*time.Hour)
+		if err != nil {
+			log.Printf("buildAskContext news %s: %v", symbol, err)
+			time.Sleep(120 * time.Millisecond)
+			continue
+		}
+		for i, a := range articles {
+			if i >= 2 {
+				break
+			}
+			macro = append(macro, headline{
+				symbol:    symbol,
+				title:     a.Title,
+				published: a.Published,
+			})
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+	sort.Slice(macro, func(i, j int) bool { return macro[i].published.After(macro[j].published) })
+	if len(macro) > 8 {
+		macro = macro[:8]
+	}
+
+	sb.WriteString("\n[MACRO HEADLINES]\n")
+	if len(macro) == 0 {
+		sb.WriteString("• No fresh macro headlines available.\n")
+	} else {
+		for _, h := range macro {
+			sb.WriteString(fmt.Sprintf("• [%s %s] %s\n", h.symbol, formatAgeShort(now.Sub(h.published)), h.title))
+		}
+	}
+
+	// Try to enrich with symbols referenced in the user's question.
+	questionSymbols := extractQuestionSymbols(question)
+	if len(questionSymbols) > 0 {
+		sb.WriteString("\n[QUESTION SYMBOLS]\n")
+		added := 0
+		for _, symbol := range questionSymbols {
+			q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+			if err != nil {
+				log.Printf("buildAskContext question quote %s: %v", symbol, err)
+				time.Sleep(120 * time.Millisecond)
+				continue
+			}
+			added++
+			sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
+
+			articles, err := yahoo.FetchRecentNews(symbol, 24*time.Hour)
+			if err != nil {
+				log.Printf("buildAskContext question news %s: %v", symbol, err)
+				time.Sleep(120 * time.Millisecond)
+				continue
+			}
+			for i, a := range articles {
+				if i >= 2 {
+					break
+				}
+				sb.WriteString(fmt.Sprintf("  - [%s] %s\n", formatAgeShort(now.Sub(a.Published)), a.Title))
+			}
+			time.Sleep(120 * time.Millisecond)
+		}
+		if added == 0 {
+			sb.WriteString("• No valid tradable symbols could be resolved from the question.\n")
+		}
+	}
+
+	// User watchlist snapshot + cached headlines.
+	watchlist := b.Store.GetSymbols(chatID)
+	sb.WriteString("\n[WATCHLIST SNAPSHOT]\n")
+	if len(watchlist) == 0 {
+		sb.WriteString("• No symbols in user watchlist.\n")
+	} else {
+		limit := len(watchlist)
+		if limit > 6 {
+			limit = 6
+		}
+		for _, symbol := range watchlist[:limit] {
+			q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
+			if err != nil {
+				log.Printf("buildAskContext watchlist quote %s: %v", symbol, err)
+				time.Sleep(120 * time.Millisecond)
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
+			time.Sleep(120 * time.Millisecond)
+		}
+		if len(watchlist) > limit {
+			sb.WriteString(fmt.Sprintf("• +%d more watchlist symbols not shown\n", len(watchlist)-limit))
+		}
+	}
+
+	latest := b.Store.GetLatestArticles(chatID, "", 10)
+	sb.WriteString("\n[WATCHLIST NEWS]\n")
+	if len(latest) == 0 {
+		sb.WriteString("• No cached watchlist headlines.\n")
+	} else {
+		for _, a := range latest {
+			sb.WriteString(fmt.Sprintf("• [%s %s] %s\n", a.Symbol, formatAgeShort(now.Sub(a.Published)), a.Title))
+		}
+	}
+
+	return sb.String()
+}
+
+func formatAgeShort(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	switch {
+	case d < time.Hour:
+		return "<1h"
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	default:
+		return fmt.Sprintf("%dw", int(d.Hours()/(24*7)))
+	}
+}
+
+var questionSymbolPattern = regexp.MustCompile(`[$^]?[A-Za-z][A-Za-z0-9\.]{0,9}`)
+
+func extractQuestionSymbols(question string) []string {
+	stopwords := map[string]bool{
+		"A": true, "AN": true, "AND": true, "ARE": true, "AS": true, "AT": true, "BE": true,
+		"BY": true, "DO": true, "FOR": true, "FROM": true, "HOW": true, "IF": true, "IN": true,
+		"IS": true, "IT": true, "MARKET": true, "ME": true, "MY": true, "NEWS": true, "OF": true,
+		"ON": true, "OR": true, "OUTLOOK": true, "PRICE": true, "SECTOR": true, "SHOULD": true,
+		"STOCK": true, "THE": true, "THEY": true, "THIS": true, "TO": true, "TODAY": true, "VS": true,
+		"WHAT": true, "WHEN": true, "WHY": true, "WITH": true,
+	}
+
+	matches := questionSymbolPattern.FindAllString(question, -1)
+	seen := make(map[string]bool)
+	var symbols []string
+
+	for _, m := range matches {
+		m = strings.TrimPrefix(strings.TrimSpace(m), "$")
+		m = strings.Trim(m, ".,:;!?()[]{}\"'")
+		if m == "" {
+			continue
+		}
+
+		sym := strings.ToUpper(m)
+		if stopwords[sym] {
+			continue
+		}
+		// Keep ticker-like tokens; allow dotted tickers and index symbols.
+		if len(sym) > 5 && !strings.HasPrefix(sym, "^") && !strings.Contains(sym, ".") {
+			continue
+		}
+		if seen[sym] {
+			continue
+		}
+		seen[sym] = true
+		symbols = append(symbols, sym)
+		if len(symbols) >= 3 {
+			break
+		}
+	}
+
+	return symbols
 }
 
 // handleAnalyse generates an AI-powered stock analysis. Supports:

@@ -14,12 +14,13 @@ import (
 	"TradingNewsBot/storage"
 )
 
-// pendingAction values: we're waiting for the user to reply with a symbol or "all".
+// pendingAction values: we're waiting for a follow-up user reply (symbol, threshold, or free-form ask).
 const (
 	pendingAdd     = "add"
 	pendingRemove  = "remove"
 	pendingNews    = "news"
 	pendingAnalyse = "analyse"
+	pendingAsk     = "ask"
 	pendingPrice   = "price"
 	pendingAlerts  = "alerts"
 	pendingDND     = "dnd"
@@ -27,16 +28,16 @@ const (
 
 // Bot wraps the Telegram bot API and application dependencies.
 type Bot struct {
-	API              *tgbotapi.BotAPI
-	Store            *storage.Store
-	Analyser            *analysis.Analyser
-	AnalyseWhitelist    map[int64]bool
-	WatchlistWhitelist  map[int64]bool // user IDs that get 20 watchlist slots instead of 10
-	OpenAIAPIKey        string
+	API                *tgbotapi.BotAPI
+	Store              *storage.Store
+	Analyser           *analysis.Analyser
+	AnalyseWhitelist   map[int64]bool
+	WatchlistWhitelist map[int64]bool // user IDs that get 20 watchlist slots instead of 10
+	OpenAIAPIKey       string
 
-	pendingMu       sync.Mutex
-	pendingAction   map[int64]string // chatID -> "add" | "remove" | "news" | "analyse"
-	pendingUserID   map[int64]int64  // chatID -> userID (for rate limit when handling pending)
+	pendingMu     sync.Mutex
+	pendingAction map[int64]string // chatID -> pending action key
+	pendingUserID map[int64]int64  // chatID -> userID (for rate limit when handling pending)
 }
 
 const maxAnalysePerDay = 5
@@ -55,10 +56,10 @@ func (b *Bot) getAnalyseLimitStatus(userID int64) (allowed bool, remaining int) 
 	return remaining > 0, remaining
 }
 
-// getSlotLimit returns max watchlist slots for the user (20 if whitelisted or paid for expansion, 10 otherwise).
+// getSlotLimit returns max watchlist slots for the user (unlimited if whitelisted, 20 if paid for expansion, 10 otherwise).
 func (b *Bot) getSlotLimit(chatID int64) int {
 	if b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID] {
-		return 20
+		return 1<<31 - 1 // unlimited for whitelisted users
 	}
 	expanded, err := b.Store.HasSlotsExpanded(chatID)
 	if err != nil {
@@ -95,14 +96,14 @@ func New(token string, store *storage.Store, analyser *analysis.Analyser, analys
 	log.Printf("Authorized on Telegram as @%s", api.Self.UserName)
 
 	return &Bot{
-		API:                 api,
-		Store:               store,
-		Analyser:            analyser,
-		AnalyseWhitelist:    analyseWhitelist,
-		WatchlistWhitelist:  watchlistWhitelist,
-		OpenAIAPIKey:        openaiKey,
-		pendingAction:       make(map[int64]string),
-		pendingUserID:       make(map[int64]int64),
+		API:                api,
+		Store:              store,
+		Analyser:           analyser,
+		AnalyseWhitelist:   analyseWhitelist,
+		WatchlistWhitelist: watchlistWhitelist,
+		OpenAIAPIKey:       openaiKey,
+		pendingAction:      make(map[int64]string),
+		pendingUserID:      make(map[int64]int64),
 	}, nil
 }
 
@@ -124,9 +125,17 @@ func (b *Bot) downloadFile(fileID string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// isWhitelisted returns true if the chatID appears in any whitelist.
+func (b *Bot) isWhitelisted(chatID int64) bool {
+	return b.AnalyseWhitelist[chatID] || (b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID])
+}
+
 // requireEligible checks subscription status. If not eligible, sends paywall and invoice, returns true (blocked).
-// Caller should return when true. Returns false when eligible (proceed with command).
+// Whitelisted users always pass. Caller should return when true. Returns false when eligible (proceed with command).
 func (b *Bot) requireEligible(chatID int64) bool {
+	if b.isWhitelisted(chatID) {
+		return false
+	}
 	if err := b.Store.RecordFirstUse(chatID); err != nil {
 		log.Printf("RecordFirstUse error: %v", err)
 	}
@@ -143,8 +152,50 @@ func (b *Bot) requireEligible(chatID int64) bool {
 	return false
 }
 
+// registerCommands sets the bot menu commands visible in Telegram's "/" autocomplete.
+func (b *Bot) registerCommands() {
+	cmds := tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "add", Description: "Add stock to watchlist"},
+		tgbotapi.BotCommand{Command: "remove", Description: "Remove stock from watchlist"},
+		tgbotapi.BotCommand{Command: "list", Description: "View your watchlist"},
+		tgbotapi.BotCommand{Command: "news", Description: "Latest headlines"},
+		tgbotapi.BotCommand{Command: "price", Description: "Live price quote"},
+		tgbotapi.BotCommand{Command: "analyse", Description: "AI stock analysis"},
+		tgbotapi.BotCommand{Command: "ask", Description: "Ask a market question"},
+		tgbotapi.BotCommand{Command: "reports", Description: "Earnings report dates"},
+		tgbotapi.BotCommand{Command: "alerts", Description: "Manage price alerts"},
+		tgbotapi.BotCommand{Command: "configure", Description: "Digest, alerts & DND settings"},
+		tgbotapi.BotCommand{Command: "help", Description: "How to use this bot"},
+		tgbotapi.BotCommand{Command: "support", Description: "Payment or subscription help"},
+	)
+	if _, err := b.API.Request(cmds); err != nil {
+		log.Printf("Failed to register bot commands: %v", err)
+	}
+}
+
+// persistentKeyboard returns a reply keyboard with common actions.
+func persistentKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.ReplyKeyboardMarkup{
+		Keyboard: [][]tgbotapi.KeyboardButton{
+			{
+				{Text: "/news"},
+				{Text: "/price"},
+				{Text: "/analyse"},
+			},
+			{
+				{Text: "/alerts"},
+				{Text: "/configure"},
+				{Text: "/help"},
+			},
+		},
+		ResizeKeyboard: true,
+	}
+}
+
 // Start begins polling for updates and dispatching commands.
 func (b *Bot) Start() {
+	b.registerCommands()
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
@@ -257,6 +308,11 @@ func (b *Bot) Start() {
 				continue
 			}
 			b.handleAnalyse(update.Message)
+		case "ask":
+			if b.requireEligible(chatID) {
+				continue
+			}
+			b.handleAsk(update.Message)
 		case "reports":
 			if b.requireEligible(chatID) {
 				continue
@@ -272,11 +328,11 @@ func (b *Bot) Start() {
 				continue
 			}
 			b.handleAlerts(update.Message)
-		case "settings":
+		case "settings", "configure":
 			if b.requireEligible(chatID) {
 				continue
 			}
-			b.handleSettings(update.Message)
+			b.handleConfigure(update.Message)
 		case "support":
 			b.handleSupport(update.Message)
 		case "terms":
