@@ -100,3 +100,12 @@ CREATE TABLE IF NOT EXISTS analyse_usage (
     count      INT NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, usage_date)
 );
+
+-- Database-backed whitelist flags for admin overrides
+CREATE TABLE IF NOT EXISTS user_whitelists (
+    chat_id           BIGINT PRIMARY KEY,
+    analyse_enabled   BOOLEAN NOT NULL DEFAULT FALSE,
+    watchlist_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

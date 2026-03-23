@@ -16,17 +16,21 @@ import (
 // =====================================================
 // EDIT YOUR BROADCAST MESSAGE HERE
 // =====================================================
-const message = `Hey there! New update deployed 🚀
+const message = `Quick update:
 
-<b>What's new:</b>
+You'll now see new <b>/alerts</b> and <b>/configure</b> buttons in the bot.
 
-1. <b>Price alerts</b> — Intraday and after-hours alerts when your watchlist moves.
+They do different things:
 
-2. <b>Reports</b> — Morning snapshot and weekly recap delivered to you on schedule.
+1. <b>/alerts</b> is where you add and manage price alerts for specific stocks.
+2. <b>/configure</b> is where you control how often messages come through:
+   - how often news digests are sent
+   - how often price alerts are checked
+   - your Do Not Disturb window
 
-3. <b>Photo watchlist</b> — Send /add, then send a screenshot of your watchlist. The bot extracts stock symbols and adds them automatically.
+Important: <b>quiet hours are currently in UTC</b>, not SGT yet, so please convert the time if you're in Singapore.
 
-Let me know if anything breaks.`
+Use <b>/configure</b> any time to adjust it.`
 
 // Set to true to use HTML formatting in the message above.
 // When true, you can use <b>bold</b>, <i>italic</i>, <a href="...">links</a>.

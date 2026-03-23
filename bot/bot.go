@@ -42,10 +42,42 @@ type Bot struct {
 
 const maxAnalysePerDay = 5
 
+func (b *Bot) getWhitelistStatus(chatID int64) (analyse, watchlist bool) {
+	analyse = b.AnalyseWhitelist[chatID]
+	watchlist = b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID]
+
+	if b.Store == nil {
+		return analyse, watchlist
+	}
+
+	status, err := b.Store.GetWhitelistStatus(chatID)
+	if err != nil {
+		log.Printf("GetWhitelistStatus error: %v", err)
+		return analyse, watchlist
+	}
+	if status.Analyse {
+		analyse = true
+	}
+	if status.Watchlist {
+		watchlist = true
+	}
+	return analyse, watchlist
+}
+
+func (b *Bot) isAnalyseWhitelisted(chatID int64) bool {
+	analyse, _ := b.getWhitelistStatus(chatID)
+	return analyse
+}
+
+func (b *Bot) isWatchlistWhitelisted(chatID int64) bool {
+	_, watchlist := b.getWhitelistStatus(chatID)
+	return watchlist
+}
+
 // getAnalyseLimitStatus returns whether the user can analyse and how many remain. Does NOT increment.
 // Whitelisted users (ANALYSE_WHITELIST) bypass the limit entirely.
 func (b *Bot) getAnalyseLimitStatus(userID int64) (allowed bool, remaining int) {
-	if b.AnalyseWhitelist[userID] {
+	if b.isAnalyseWhitelisted(userID) {
 		return true, maxAnalysePerDay
 	}
 	_, remaining, err := b.Store.GetAnalyseUsage(userID, maxAnalysePerDay)
@@ -58,7 +90,7 @@ func (b *Bot) getAnalyseLimitStatus(userID int64) (allowed bool, remaining int) 
 
 // getSlotLimit returns max watchlist slots for the user (unlimited if whitelisted, 20 if paid for expansion, 10 otherwise).
 func (b *Bot) getSlotLimit(chatID int64) int {
-	if b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID] {
+	if b.isWatchlistWhitelisted(chatID) {
 		return 1<<31 - 1 // unlimited for whitelisted users
 	}
 	expanded, err := b.Store.HasSlotsExpanded(chatID)
@@ -75,7 +107,7 @@ func (b *Bot) getSlotLimit(chatID int64) int {
 // consumeAnalyseSlot increments the daily count in DB. Call only once per actual analysis (in doAnalyse).
 // Whitelisted users bypass the limit and do not consume a slot.
 func (b *Bot) consumeAnalyseSlot(userID int64) (allowed bool, remaining int) {
-	if b.AnalyseWhitelist[userID] {
+	if b.isAnalyseWhitelisted(userID) {
 		return true, maxAnalysePerDay
 	}
 	allowed, remaining, err := b.Store.ConsumeAnalyseSlot(userID, maxAnalysePerDay)
@@ -127,7 +159,8 @@ func (b *Bot) downloadFile(fileID string) ([]byte, error) {
 
 // isWhitelisted returns true if the chatID appears in any whitelist.
 func (b *Bot) isWhitelisted(chatID int64) bool {
-	return b.AnalyseWhitelist[chatID] || (b.WatchlistWhitelist != nil && b.WatchlistWhitelist[chatID])
+	analyse, watchlist := b.getWhitelistStatus(chatID)
+	return analyse || watchlist
 }
 
 // requireEligible checks subscription status. If not eligible, sends paywall and invoice, returns true (blocked).
@@ -328,7 +361,7 @@ func (b *Bot) Start() {
 				continue
 			}
 			b.handleAlerts(update.Message)
-		case "settings", "configure":
+		case "configure":
 			if b.requireEligible(chatID) {
 				continue
 			}

@@ -133,18 +133,35 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 
 	welcome := `Hey — glad you're here. 👋
 
-I'm here to help you keep tabs on the stocks you care about. Instead of jumping between apps and feeds, I bring together news, earnings dates, and AI analysis in one place.
+I bring together news, earnings dates, price alerts, and AI analysis for the stocks you care about — all in one place.
 
-You'll get news summaries every 4 hours, morning snapshots, price alerts for your watchlist, and a weekly recap — all sent automatically.
+You'll get news summaries every 4 hours, morning snapshots, price alerts, and a weekly recap — all sent automatically.
 
-First 30 days are free, then 100 Stars/month.
+<b>Getting started</b>
+/add — Add stocks to your watchlist (type a ticker like AAPL, or send a screenshot)
+/list — View your current watchlist
 
-Start by adding a few stocks: /add, then reply with a ticker (like AAPL) or send a screenshot of your watchlist — I'll pull the symbols out. You can add up to 10. /list shows what you're tracking.
+<b>Stay informed</b>
+/news — Latest headlines for your watchlist
+/price — Live price quotes
+/reports — Upcoming earnings dates
+/alerts — Set price alerts (e.g. /alerts AAPL 5%)
 
-Then: /news for headlines, /reports for earnings dates, /analyse for stock deep-dives, /ask for market Q&A. /help has the full list.
+<b>AI-powered</b>
+/analyse — Deep-dive analysis on any stock
+/ask — Ask any market question
 
-/support for payment help. (Info only — not financial advice.)`
+<b>Customise</b>
+/configure — Digest frequency, alert frequency, DND, manage alerts
+
+/help — Full details on every command
+/support — Payment or subscription help
+
+First 30 days are free, then 100 Stars/month. (Info only — not financial advice.)
+
+Start by adding a few stocks — just type /add and reply with a ticker.`
 	welcomeMsg := tgbotapi.NewMessage(chatID, welcome)
+	welcomeMsg.ParseMode = "HTML"
 	welcomeMsg.ReplyMarkup = persistentKeyboard()
 	if _, err := b.API.Send(welcomeMsg); err != nil {
 		log.Printf("Error sending welcome to %d: %v", chatID, err)
@@ -214,7 +231,6 @@ Set per-stock thresholds to get notified when a price target or percentage move 
 	"settings": `<b>Settings</b>
 
 /configure - All-in-one settings: digest frequency, alert frequency, DND, manage alerts
-/settings - Same as /configure
 
 Set how often news digests are sent (2h/4h/8h/24h), how often price alerts are checked (1h/2h/4h/8h), set a Do Not Disturb window, and manage your per-stock price alerts.`,
 }

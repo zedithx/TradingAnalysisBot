@@ -29,6 +29,15 @@ type UserData struct {
 	Articles map[string][]CachedArticle `json:"articles"`
 }
 
+// WhitelistStatus stores whitelist flags for a user/chat.
+type WhitelistStatus struct {
+	ChatID     int64
+	Analyse    bool
+	Watchlist  bool
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 // Store provides Supabase/Postgres-backed storage for all users.
 type Store struct {
 	pool *pgxpool.Pool
@@ -57,6 +66,7 @@ func New(databaseURL string) (*Store, error) {
 	store.ensureTrialReminderColumns(ctx)
 	store.ensureAlertTriggersTable(ctx)
 	store.ensureSwingTraderTables(ctx)
+	store.ensureWhitelistTable(ctx)
 	return store, nil
 }
 
@@ -147,6 +157,21 @@ func (s *Store) ensureSwingTraderTables(ctx context.Context) {
 	}
 }
 
+// ensureWhitelistTable creates the user_whitelists table if it doesn't exist.
+func (s *Store) ensureWhitelistTable(ctx context.Context) {
+	_, err := s.pool.Exec(ctx,
+		`CREATE TABLE IF NOT EXISTS user_whitelists (
+			chat_id BIGINT PRIMARY KEY,
+			analyse_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			watchlist_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`)
+	if err != nil {
+		log.Printf("ensureWhitelistTable: %v", err)
+	}
+}
+
 // RecordAlertTrigger upserts the alert trigger timestamp for deduplication.
 func (s *Store) RecordAlertTrigger(chatID int64, symbol, triggerType string) error {
 	return s.RecordAlertTriggerValue(chatID, symbol, triggerType, nil)
@@ -225,6 +250,105 @@ func (s *Store) ensureUser(ctx context.Context, chatID int64) error {
 		chatID,
 	)
 	return err
+}
+
+// GetWhitelistStatus returns database-backed whitelist flags for a chat.
+func (s *Store) GetWhitelistStatus(chatID int64) (WhitelistStatus, error) {
+	var status WhitelistStatus
+	status.ChatID = chatID
+
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT chat_id, analyse_enabled, watchlist_enabled, created_at, updated_at
+		 FROM user_whitelists
+		 WHERE chat_id = $1`,
+		chatID,
+	).Scan(&status.ChatID, &status.Analyse, &status.Watchlist, &status.CreatedAt, &status.UpdatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return status, nil
+		}
+		return status, err
+	}
+
+	return status, nil
+}
+
+// AddWhitelistFlags enables whitelist flags for a chat without disabling existing flags.
+func (s *Store) AddWhitelistFlags(chatID int64, analyse, watchlist bool) error {
+	if !analyse && !watchlist {
+		return nil
+	}
+
+	_, err := s.pool.Exec(context.Background(),
+		`INSERT INTO user_whitelists (chat_id, analyse_enabled, watchlist_enabled, created_at, updated_at)
+		 VALUES ($1, $2, $3, NOW(), NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET
+		   analyse_enabled = user_whitelists.analyse_enabled OR EXCLUDED.analyse_enabled,
+		   watchlist_enabled = user_whitelists.watchlist_enabled OR EXCLUDED.watchlist_enabled,
+		   updated_at = NOW()`,
+		chatID, analyse, watchlist,
+	)
+	return err
+}
+
+// RemoveWhitelistFlags disables selected whitelist flags for a chat.
+func (s *Store) RemoveWhitelistFlags(chatID int64, analyse, watchlist bool) error {
+	if !analyse && !watchlist {
+		return nil
+	}
+
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE user_whitelists
+		 SET analyse_enabled = CASE WHEN $2 THEN FALSE ELSE analyse_enabled END,
+		     watchlist_enabled = CASE WHEN $3 THEN FALSE ELSE watchlist_enabled END,
+		     updated_at = NOW()
+		 WHERE chat_id = $1`,
+		chatID, analyse, watchlist,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM user_whitelists
+		 WHERE chat_id = $1
+		   AND NOT analyse_enabled
+		   AND NOT watchlist_enabled`,
+		chatID,
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// ListWhitelists returns all active database-backed whitelist entries.
+func (s *Store) ListWhitelists() ([]WhitelistStatus, error) {
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT chat_id, analyse_enabled, watchlist_enabled, created_at, updated_at
+		 FROM user_whitelists
+		 WHERE analyse_enabled OR watchlist_enabled
+		 ORDER BY chat_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []WhitelistStatus
+	for rows.Next() {
+		var status WhitelistStatus
+		if err := rows.Scan(&status.ChatID, &status.Analyse, &status.Watchlist, &status.CreatedAt, &status.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, status)
+	}
+	return result, rows.Err()
 }
 
 // IsEligible returns true if the user is in their free period or has an active subscription.

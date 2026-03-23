@@ -14,6 +14,40 @@ import (
 	"TradingNewsBot/storage"
 )
 
+func seedEnvWhitelists(store *storage.Store, analyseWhitelist, watchlistWhitelist map[int64]bool) {
+	type flags struct {
+		analyse   bool
+		watchlist bool
+	}
+
+	entries := make(map[int64]flags)
+	for chatID := range analyseWhitelist {
+		entry := entries[chatID]
+		entry.analyse = true
+		entries[chatID] = entry
+	}
+	for chatID := range watchlistWhitelist {
+		entry := entries[chatID]
+		entry.watchlist = true
+		entries[chatID] = entry
+	}
+
+	if len(entries) == 0 {
+		return
+	}
+
+	seeded := 0
+	for chatID, entry := range entries {
+		if err := store.AddWhitelistFlags(chatID, entry.analyse, entry.watchlist); err != nil {
+			log.Printf("Failed to seed whitelist for %d: %v", chatID, err)
+			continue
+		}
+		seeded++
+	}
+
+	log.Printf("Seeded %d whitelist entries from env into database", seeded)
+}
+
 func main() {
 	// Load configuration
 	cfg, err := config.Load()
@@ -33,6 +67,7 @@ func main() {
 	}
 	defer store.Close()
 	log.Println("Connected to Supabase database")
+	seedEnvWhitelists(store, cfg.AnalyseWhitelist, cfg.WatchlistWhitelist)
 
 	// Initialize AI analyser
 	analyser := analysis.New(cfg.OpenAIAPIKey)
