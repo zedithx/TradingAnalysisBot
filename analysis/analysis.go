@@ -49,35 +49,6 @@ func (a *Analyser) Analyse(symbol string, articles []storage.CachedArticle, quot
 	return completion.Choices[0].Message.Content, nil
 }
 
-// AskMarket answers a market-related user question using the supplied context block.
-func (a *Analyser) AskMarket(question, contextBlock string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	var sb strings.Builder
-	sb.WriteString("USER QUESTION:\n")
-	sb.WriteString(strings.TrimSpace(question))
-	sb.WriteString("\n\nMARKET CONTEXT:\n")
-	sb.WriteString(strings.TrimSpace(contextBlock))
-
-	completion, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: openai.ChatModelGPT4oMini,
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(marketAskSystemPrompt),
-			openai.UserMessage(sb.String()),
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("OpenAI API error: %w", err)
-	}
-
-	if len(completion.Choices) == 0 {
-		return "", fmt.Errorf("no response from OpenAI")
-	}
-
-	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
-}
-
 const systemPrompt = `You are a senior equity research analyst at Goldman Sachs with 20+ years of experience covering global markets. You think in terms of risk/reward, catalysts, positioning, and institutional flows. You've seen multiple market cycles and have a sharp nose for when consensus narrative diverges from reality.
 
 Your analysis framework:
@@ -246,21 +217,6 @@ func min(a, b int) int {
 }
 
 const summarizerPrompt = `You are a financial news summarizer. Given a list of recent headlines for a company, write a 2-4 sentence summary that captures the key developments, sentiment, and what matters for investors. Be concise and actionable. No fluff. Plain text only, no markdown.`
-
-const marketAskSystemPrompt = `You are a market intelligence assistant. Answer the user's question using the provided market context (fresh headlines, index/ETF prices, and watchlist data).
-
-Method:
-1) Start with a direct answer in 1-2 lines.
-2) Provide evidence from the provided context, prioritizing the most recent items.
-3) Clearly separate facts from inference (use labels: "Facts" and "Inference").
-4) If context is missing/stale for the question, say exactly what is missing and give the best conditional answer.
-5) Include actionable watchpoints (next catalyst, level, or data release to monitor).
-
-Rules:
-• Do not fabricate data, headlines, dates, or prices.
-• If question is not market-related, politely ask the user to keep it market/investing related.
-• Keep answer concise and readable for chat (about 120-320 words).
-• Plain text only.`
 
 // SummarizeHeadlines produces a brief AI summary of news headlines for a symbol.
 func (a *Analyser) SummarizeHeadlines(symbol string, headlines []string) (string, error) {

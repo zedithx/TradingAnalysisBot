@@ -14,13 +14,12 @@ import (
 	"TradingNewsBot/storage"
 )
 
-// pendingAction values: we're waiting for a follow-up user reply (symbol, threshold, or free-form ask).
+// pendingAction values: we're waiting for a follow-up user reply (symbol, threshold, or settings input).
 const (
 	pendingAdd     = "add"
 	pendingRemove  = "remove"
 	pendingNews    = "news"
 	pendingAnalyse = "analyse"
-	pendingAsk     = "ask"
 	pendingPrice   = "price"
 	pendingAlerts  = "alerts"
 	pendingDND     = "dnd"
@@ -194,7 +193,6 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "news", Description: "Latest headlines"},
 		tgbotapi.BotCommand{Command: "price", Description: "Live price quote"},
 		tgbotapi.BotCommand{Command: "analyse", Description: "AI stock analysis"},
-		tgbotapi.BotCommand{Command: "ask", Description: "Ask a market question"},
 		tgbotapi.BotCommand{Command: "reports", Description: "Earnings report dates"},
 		tgbotapi.BotCommand{Command: "alerts", Description: "Manage price alerts"},
 		tgbotapi.BotCommand{Command: "configure", Description: "Digest, alerts & DND settings"},
@@ -342,10 +340,9 @@ func (b *Bot) Start() {
 			}
 			b.handleAnalyse(update.Message)
 		case "ask":
-			if b.requireEligible(chatID) {
-				continue
-			}
-			b.handleAsk(update.Message)
+			b.sendText(chatID,
+				"/ask has been removed because it wasn't reliable for real-time market updates. Use /news for fresh headlines and /analyse for stock-specific analysis.",
+			)
 		case "reports":
 			if b.requireEligible(chatID) {
 				continue

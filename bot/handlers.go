@@ -3,8 +3,6 @@ package bot
 import (
 	"fmt"
 	"log"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -149,7 +147,6 @@ You'll get news summaries every 4 hours, morning snapshots, price alerts, and a 
 
 <b>AI-powered</b>
 /analyse — Deep-dive analysis on any stock
-/ask — Ask any market question
 
 <b>Customise</b>
 /configure — Digest frequency, alert frequency, DND, manage alerts
@@ -213,12 +210,7 @@ Earnings reports (Q1–Q4) are when companies publish financials — revenue, ne
 
 Consolidates recent news, live price data, and earnings info, then uses AI to provide a sentiment summary, key risk factors, and a short-term outlook.
 
-<b>Market Q&amp;A</b>
-
-/ask QUESTION - Ask anything market-related
-/ask - Reply with your question
-
-Uses current market context (headlines, index snapshots, watchlist data) to generate a structured answer.`,
+For fresh headlines and live market updates, use /news and /price.`,
 
 	"alerts": `<b>Price Alerts</b>
 
@@ -455,7 +447,7 @@ func (b *Bot) doRemove(chatID int64, symbol string) {
 	b.sendText(chatID, fmt.Sprintf("Removed %s from your watchlist.", symbol))
 }
 
-// handlePendingSymbol processes a reply after commands that request follow-up input (/add, /remove, /news, /price, /alerts, /analyse, /ask).
+// handlePendingSymbol processes a reply after commands that request follow-up input (/add, /remove, /news, /price, /alerts, /analyse).
 func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 	switch action {
 	case pendingAdd:
@@ -488,8 +480,6 @@ func (b *Bot) handlePendingSymbol(chatID, userID int64, action, text string) {
 			return
 		}
 		b.doAnalyse(chatID, userID, text)
-	case pendingAsk:
-		b.doAsk(chatID, text)
 	}
 }
 
@@ -1172,235 +1162,6 @@ func (b *Bot) handleReportsUpcoming(chatID int64) {
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 	b.API.Send(msg)
-}
-
-// handleAsk answers market-related questions using fresh market context + AI.
-func (b *Bot) handleAsk(msg *tgbotapi.Message) {
-	question := strings.TrimSpace(msg.CommandArguments())
-	if question == "" {
-		b.pendingMu.Lock()
-		b.pendingAction[msg.Chat.ID] = pendingAsk
-		if msg.From != nil {
-			b.pendingUserID[msg.Chat.ID] = msg.From.ID
-		}
-		b.pendingMu.Unlock()
-		b.sendText(msg.Chat.ID, "Ask me anything market-related. Example: /ask Why are semis weak today and what levels matter for NVDA?")
-		return
-	}
-
-	b.doAsk(msg.Chat.ID, question)
-}
-
-func (b *Bot) doAsk(chatID int64, question string) {
-	question = strings.TrimSpace(question)
-	if question == "" {
-		b.sendText(chatID, "Please send a market-related question after /ask.")
-		return
-	}
-	if b.Analyser == nil {
-		b.sendText(chatID, "AI market Q&A is currently unavailable.")
-		return
-	}
-
-	b.sendText(chatID, "Working on it...")
-	contextBlock := b.buildAskContext(chatID, question)
-	answer, err := b.Analyser.AskMarket(question, contextBlock)
-	if err != nil {
-		log.Printf("AskMarket error: %v", err)
-		b.sendText(chatID, "I couldn't generate an answer right now. Please try again in a moment.")
-		return
-	}
-	b.sendText(chatID, answer)
-}
-
-func (b *Bot) buildAskContext(chatID int64, question string) string {
-	now := time.Now().UTC()
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Generated at: %s UTC\n", now.Format("2006-01-02 15:04")))
-
-	// Broad market snapshot from liquid US proxies.
-	sb.WriteString("\n[MARKET SNAPSHOT]\n")
-	for _, symbol := range []string{"SPY", "QQQ", "DIA", "IWM", "^VIX"} {
-		q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
-		if err != nil {
-			log.Printf("buildAskContext quote %s: %v", symbol, err)
-			time.Sleep(120 * time.Millisecond)
-			continue
-		}
-		sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
-		time.Sleep(120 * time.Millisecond)
-	}
-
-	// Fresh macro/market headlines.
-	type headline struct {
-		symbol    string
-		title     string
-		published time.Time
-	}
-	var macro []headline
-	for _, symbol := range []string{"SPY", "QQQ", "^GSPC"} {
-		articles, err := yahoo.FetchRecentNews(symbol, 18*time.Hour)
-		if err != nil {
-			log.Printf("buildAskContext news %s: %v", symbol, err)
-			time.Sleep(120 * time.Millisecond)
-			continue
-		}
-		for i, a := range articles {
-			if i >= 2 {
-				break
-			}
-			macro = append(macro, headline{
-				symbol:    symbol,
-				title:     a.Title,
-				published: a.Published,
-			})
-		}
-		time.Sleep(120 * time.Millisecond)
-	}
-	sort.Slice(macro, func(i, j int) bool { return macro[i].published.After(macro[j].published) })
-	if len(macro) > 8 {
-		macro = macro[:8]
-	}
-
-	sb.WriteString("\n[MACRO HEADLINES]\n")
-	if len(macro) == 0 {
-		sb.WriteString("• No fresh macro headlines available.\n")
-	} else {
-		for _, h := range macro {
-			sb.WriteString(fmt.Sprintf("• [%s %s] %s\n", h.symbol, formatAgeShort(now.Sub(h.published)), h.title))
-		}
-	}
-
-	// Try to enrich with symbols referenced in the user's question.
-	questionSymbols := extractQuestionSymbols(question)
-	if len(questionSymbols) > 0 {
-		sb.WriteString("\n[QUESTION SYMBOLS]\n")
-		added := 0
-		for _, symbol := range questionSymbols {
-			q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
-			if err != nil {
-				log.Printf("buildAskContext question quote %s: %v", symbol, err)
-				time.Sleep(120 * time.Millisecond)
-				continue
-			}
-			added++
-			sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
-
-			articles, err := yahoo.FetchRecentNews(symbol, 24*time.Hour)
-			if err != nil {
-				log.Printf("buildAskContext question news %s: %v", symbol, err)
-				time.Sleep(120 * time.Millisecond)
-				continue
-			}
-			for i, a := range articles {
-				if i >= 2 {
-					break
-				}
-				sb.WriteString(fmt.Sprintf("  - [%s] %s\n", formatAgeShort(now.Sub(a.Published)), a.Title))
-			}
-			time.Sleep(120 * time.Millisecond)
-		}
-		if added == 0 {
-			sb.WriteString("• No valid tradable symbols could be resolved from the question.\n")
-		}
-	}
-
-	// User watchlist snapshot + cached headlines.
-	watchlist := b.Store.GetSymbols(chatID)
-	sb.WriteString("\n[WATCHLIST SNAPSHOT]\n")
-	if len(watchlist) == 0 {
-		sb.WriteString("• No symbols in user watchlist.\n")
-	} else {
-		limit := len(watchlist)
-		if limit > 6 {
-			limit = 6
-		}
-		for _, symbol := range watchlist[:limit] {
-			q, err := yahoo.FetchQuoteExtendedWithFallback(symbol)
-			if err != nil {
-				log.Printf("buildAskContext watchlist quote %s: %v", symbol, err)
-				time.Sleep(120 * time.Millisecond)
-				continue
-			}
-			sb.WriteString(fmt.Sprintf("• %s: %s\n", symbol, q.SessionPriceSummary()))
-			time.Sleep(120 * time.Millisecond)
-		}
-		if len(watchlist) > limit {
-			sb.WriteString(fmt.Sprintf("• +%d more watchlist symbols not shown\n", len(watchlist)-limit))
-		}
-	}
-
-	latest := b.Store.GetLatestArticles(chatID, "", 10)
-	sb.WriteString("\n[WATCHLIST NEWS]\n")
-	if len(latest) == 0 {
-		sb.WriteString("• No cached watchlist headlines.\n")
-	} else {
-		for _, a := range latest {
-			sb.WriteString(fmt.Sprintf("• [%s %s] %s\n", a.Symbol, formatAgeShort(now.Sub(a.Published)), a.Title))
-		}
-	}
-
-	return sb.String()
-}
-
-func formatAgeShort(d time.Duration) string {
-	if d < 0 {
-		d = -d
-	}
-	switch {
-	case d < time.Hour:
-		return "<1h"
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	case d < 7*24*time.Hour:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	default:
-		return fmt.Sprintf("%dw", int(d.Hours()/(24*7)))
-	}
-}
-
-var questionSymbolPattern = regexp.MustCompile(`[$^]?[A-Za-z][A-Za-z0-9\.]{0,9}`)
-
-func extractQuestionSymbols(question string) []string {
-	stopwords := map[string]bool{
-		"A": true, "AN": true, "AND": true, "ARE": true, "AS": true, "AT": true, "BE": true,
-		"BY": true, "DO": true, "FOR": true, "FROM": true, "HOW": true, "IF": true, "IN": true,
-		"IS": true, "IT": true, "MARKET": true, "ME": true, "MY": true, "NEWS": true, "OF": true,
-		"ON": true, "OR": true, "OUTLOOK": true, "PRICE": true, "SECTOR": true, "SHOULD": true,
-		"STOCK": true, "THE": true, "THEY": true, "THIS": true, "TO": true, "TODAY": true, "VS": true,
-		"WHAT": true, "WHEN": true, "WHY": true, "WITH": true,
-	}
-
-	matches := questionSymbolPattern.FindAllString(question, -1)
-	seen := make(map[string]bool)
-	var symbols []string
-
-	for _, m := range matches {
-		m = strings.TrimPrefix(strings.TrimSpace(m), "$")
-		m = strings.Trim(m, ".,:;!?()[]{}\"'")
-		if m == "" {
-			continue
-		}
-
-		sym := strings.ToUpper(m)
-		if stopwords[sym] {
-			continue
-		}
-		// Keep ticker-like tokens; allow dotted tickers and index symbols.
-		if len(sym) > 5 && !strings.HasPrefix(sym, "^") && !strings.Contains(sym, ".") {
-			continue
-		}
-		if seen[sym] {
-			continue
-		}
-		seen[sym] = true
-		symbols = append(symbols, sym)
-		if len(symbols) >= 3 {
-			break
-		}
-	}
-
-	return symbols
 }
 
 // handleAnalyse generates an AI-powered stock analysis. Supports:
