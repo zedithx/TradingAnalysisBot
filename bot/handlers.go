@@ -870,11 +870,13 @@ func (b *Bot) handleConfigure(msg *tgbotapi.Message) {
 	freq := 4
 	alertFreq := 2
 	dndStr := "Off"
+	globalNews := false
 	if prefs != nil {
 		freq = prefs.DigestFrequencyHours
 		if prefs.AlertFrequencyHours > 0 {
 			alertFreq = prefs.AlertFrequencyHours
 		}
+		globalNews = prefs.GlobalNewsEnabled
 		if prefs.DNDStartUTC != nil && prefs.DNDEndUTC != nil {
 			dndStr = fmt.Sprintf("%02d:%02d - %02d:%02d UTC",
 				prefs.DNDStartUTC.Hour(), prefs.DNDStartUTC.Minute(),
@@ -889,6 +891,12 @@ func (b *Bot) handleConfigure(msg *tgbotapi.Message) {
 	}
 
 	alertLabel := fmt.Sprintf("Manage price alerts (%d active)", alertCount)
+	globalLabel := "Global news: Off"
+	globalToggleValue := "1"
+	if globalNews {
+		globalLabel = "Global news: On"
+		globalToggleValue = "0"
+	}
 
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -907,6 +915,9 @@ func (b *Bot) handleConfigure(msg *tgbotapi.Message) {
 			tgbotapi.NewInlineKeyboardButtonData(alertLabel, "settings:manage_alerts"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(globalLabel, "settings:global:"+globalToggleValue),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Set DND", "settings:dnd"),
 			tgbotapi.NewInlineKeyboardButtonData("Clear DND", "settings:dnd:clear"),
 		),
@@ -915,6 +926,7 @@ func (b *Bot) handleConfigure(msg *tgbotapi.Message) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("News digest: every %dh\n", freq))
 	sb.WriteString(fmt.Sprintf("Price alerts: check every %dh (%d active)\n", alertFreq, alertCount))
+	sb.WriteString(fmt.Sprintf("Global macro digest: %s\n", map[bool]string{true: "On", false: "Off"}[globalNews]))
 	sb.WriteString(fmt.Sprintf("DND: %s\n", dndStr))
 	sb.WriteString("\nTap to change:")
 
@@ -1043,6 +1055,16 @@ func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		if h, err := strconv.Atoi(sub); err == nil && (h == 1 || h == 2 || h == 4 || h == 8) {
 			_ = b.Store.SetAlertFrequency(chatID, h)
 			b.sendText(chatID, fmt.Sprintf("Price alert frequency set to every %d hour(s).", h))
+		}
+	case len(parts) >= 2 && strings.HasPrefix(parts[1], "global:"):
+		sub := strings.TrimPrefix(parts[1], "global:")
+		enabled := sub == "1"
+		if err := b.Store.SetGlobalNewsEnabled(chatID, enabled); err != nil {
+			b.sendText(chatID, "Could not update global news setting.")
+		} else if enabled {
+			b.sendText(chatID, "Global macro news digest is now on.")
+		} else {
+			b.sendText(chatID, "Global macro news digest is now off.")
 		}
 	case len(parts) >= 2 && parts[1] == "manage_alerts":
 		b.handleAlerts(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}})

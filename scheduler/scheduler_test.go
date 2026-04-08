@@ -41,6 +41,7 @@ func TestScheduler_RunJobForTest(t *testing.T) {
 	sched.RunJobForTest("checkIntradayAlerts")
 	sched.RunJobForTest("sendMorningSnapshot")
 	sched.RunJobForTest("checkAfterHoursAlerts")
+	sched.RunJobForTest("fetchGlobalNews")
 	sched.RunJobForTest("unknown") // should log and no-op
 
 	// If there are users with symbols, notified may be non-empty

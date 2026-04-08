@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,13 @@ import (
 	"TradingNewsBot/storage"
 	"TradingNewsBot/yahoo"
 )
+
+// GlobalHeadlineAssessment is the AI classification result for one global headline.
+type GlobalHeadlineAssessment struct {
+	Link       string `json:"link"`
+	Importance string `json:"importance"`
+	Summary    string `json:"summary"`
+}
 
 // Analyser generates AI-powered stock analysis using OpenAI.
 type Analyser struct {
@@ -218,6 +226,23 @@ func min(a, b int) int {
 
 const summarizerPrompt = `You are a financial news summarizer. Given a list of recent headlines for a company, write a 2-4 sentence summary that captures the key developments, sentiment, and what matters for investors. Be concise and actionable. No fluff. Plain text only, no markdown.`
 
+const globalClassifierPrompt = `You are classifying global news headlines for a market-news bot.
+
+For each headline, decide whether it is:
+- "ignore": unlikely to move broad markets or major listed companies in the next 1-3 trading days
+- "watch": relevant, but not clearly important enough for an alert
+- "major": likely to move broad markets or major listed companies in the next 1-3 trading days
+
+Treat wars, ceasefires, military escalation, sanctions, central-bank surprises, major M&A, export controls, sovereign/default stress, bank failures, large commodity disruptions, and major policy shocks as likely "major".
+
+Return compact JSON only in this shape:
+{"items":[{"link":"...","importance":"major","summary":"one sentence"}]}
+
+Rules:
+- Keep summaries to one sentence each.
+- Use "major", "watch", or "ignore" only.
+- Do not include any text outside JSON.`
+
 // SummarizeHeadlines produces a brief AI summary of news headlines for a symbol.
 func (a *Analyser) SummarizeHeadlines(symbol string, headlines []string) (string, error) {
 	if len(headlines) == 0 {
@@ -254,4 +279,105 @@ func (a *Analyser) SummarizeHeadlines(symbol string, headlines []string) (string
 	}
 
 	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+}
+
+// ClassifyGlobalHeadlineBatch labels global headlines by likely market impact.
+func (a *Analyser) ClassifyGlobalHeadlineBatch(articles []yahoo.GlobalNewsArticle) (map[string]GlobalHeadlineAssessment, error) {
+	result := make(map[string]GlobalHeadlineAssessment)
+	if len(articles) == 0 {
+		return result, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Classify these headlines:\n")
+	for i, a := range articles {
+		if i >= 20 {
+			break
+		}
+		sb.WriteString(fmt.Sprintf("%d. link=%s | topic=%s | source=%s | title=%s\n", i+1, a.Link, a.Topic, a.Source, a.Title))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	completion, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT4oMini,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(globalClassifierPrompt),
+			openai.UserMessage(sb.String()),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("OpenAI API error: %w", err)
+	}
+	if len(completion.Choices) == 0 {
+		return nil, fmt.Errorf("no response from OpenAI")
+	}
+
+	var parsed struct {
+		Items []GlobalHeadlineAssessment `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(completion.Choices[0].Message.Content)), &parsed); err != nil {
+		return nil, fmt.Errorf("parse global headline classification: %w", err)
+	}
+
+	for _, item := range parsed.Items {
+		importance := normalizeImportance(item.Importance)
+		if item.Link == "" || importance == "" {
+			continue
+		}
+		item.Importance = importance
+		item.Summary = strings.TrimSpace(item.Summary)
+		result[item.Link] = item
+	}
+
+	return result, nil
+}
+
+// SummarizeGlobalDigest produces a compact multi-headline digest paragraph.
+func (a *Analyser) SummarizeGlobalDigest(articles []storage.GlobalArticle) (string, error) {
+	if len(articles) == 0 {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Summarize these major global market headlines into 3-5 concise sentences for a Telegram digest.\n")
+	sb.WriteString("Focus on what happened, why it matters for markets, and keep it plain text.\n\n")
+	for i, a := range articles {
+		if i >= 8 {
+			break
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, a.Topic, a.Title))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	completion, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT4oMini,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage("You are a concise global macro news summarizer. Write 3-5 short plain-text sentences. No markdown."),
+			openai.UserMessage(sb.String()),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("OpenAI API error: %w", err)
+	}
+	if len(completion.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+}
+
+func normalizeImportance(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "major":
+		return "major"
+	case "watch":
+		return "watch"
+	case "ignore":
+		return "ignore"
+	default:
+		return ""
+	}
 }

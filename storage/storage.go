@@ -21,6 +21,18 @@ type CachedArticle struct {
 	FetchedAt time.Time `json:"fetched_at"`
 }
 
+// GlobalArticle is a shared macro/global article stored once for all users.
+type GlobalArticle struct {
+	Title      string    `json:"title"`
+	Link       string    `json:"link"`
+	Source     string    `json:"source"`
+	Topic      string    `json:"topic"`
+	Importance string    `json:"importance"`
+	Summary    string    `json:"summary"`
+	Published  time.Time `json:"published"`
+	FetchedAt  time.Time `json:"fetched_at"`
+}
+
 // UserData holds the watchlist and cached news for a single user.
 type UserData struct {
 	ChatID   int64                      `json:"chat_id"`
@@ -31,11 +43,11 @@ type UserData struct {
 
 // WhitelistStatus stores whitelist flags for a user/chat.
 type WhitelistStatus struct {
-	ChatID     int64
-	Analyse    bool
-	Watchlist  bool
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ChatID    int64
+	Analyse   bool
+	Watchlist bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Store provides Supabase/Postgres-backed storage for all users.
@@ -67,6 +79,7 @@ func New(databaseURL string) (*Store, error) {
 	store.ensureAlertTriggersTable(ctx)
 	store.ensureSwingTraderTables(ctx)
 	store.ensureWhitelistTable(ctx)
+	store.ensureGlobalNewsTables(ctx)
 	return store, nil
 }
 
@@ -169,6 +182,36 @@ func (s *Store) ensureWhitelistTable(ctx context.Context) {
 		)`)
 	if err != nil {
 		log.Printf("ensureWhitelistTable: %v", err)
+	}
+}
+
+// ensureGlobalNewsTables creates shared global news tables and preference columns if needed.
+func (s *Store) ensureGlobalNewsTables(ctx context.Context) {
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS global_articles (
+			link TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			source TEXT,
+			topic TEXT,
+			importance TEXT NOT NULL DEFAULT 'major',
+			summary TEXT,
+			published TIMESTAMPTZ NOT NULL,
+			fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS global_digest_state (
+			chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+			article_link TEXT NOT NULL REFERENCES global_articles(link) ON DELETE CASCADE,
+			last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (chat_id, article_link)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_articles_published ON global_articles(published DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_articles_topic ON global_articles(topic, published DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_digest_state_chat ON global_digest_state(chat_id, last_seen_at DESC)`,
+		`ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS global_news_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+	} {
+		if _, err := s.pool.Exec(ctx, q); err != nil {
+			log.Printf("ensureGlobalNewsTables: %v", err)
+		}
 	}
 }
 
@@ -809,6 +852,7 @@ type UserPreferences struct {
 	DNDStartUTC          *time.Time
 	DNDEndUTC            *time.Time
 	Timezone             string
+	GlobalNewsEnabled    bool
 	LastDigestSentAt     *time.Time
 }
 
@@ -820,10 +864,10 @@ func (s *Store) GetPreferences(chatID int64) (*UserPreferences, error) {
 	var lastSent interface{}
 	err := s.pool.QueryRow(ctx,
 		`SELECT chat_id, COALESCE(digest_frequency_hours, 4), COALESCE(alert_frequency_hours, 2), dnd_start_utc, dnd_end_utc,
-		 COALESCE(timezone, ''), last_digest_sent_at
+		 COALESCE(timezone, ''), COALESCE(global_news_enabled, FALSE), last_digest_sent_at
 		 FROM user_preferences WHERE chat_id = $1`,
 		chatID,
-	).Scan(&p.ChatID, &p.DigestFrequencyHours, &p.AlertFrequencyHours, &dndStart, &dndEnd, &p.Timezone, &lastSent)
+	).Scan(&p.ChatID, &p.DigestFrequencyHours, &p.AlertFrequencyHours, &dndStart, &dndEnd, &p.Timezone, &p.GlobalNewsEnabled, &lastSent)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return &UserPreferences{ChatID: chatID, DigestFrequencyHours: 4, AlertFrequencyHours: 2}, nil
@@ -922,6 +966,185 @@ func (s *Store) SetLastDigestSentAt(chatID int64, t time.Time) error {
 		chatID, t,
 	)
 	return err
+}
+
+// SetGlobalNewsEnabled updates whether a user receives macro/global digests.
+func (s *Store) SetGlobalNewsEnabled(chatID int64, enabled bool) error {
+	ctx := context.Background()
+	if err := s.ensureUser(ctx, chatID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_preferences (chat_id, global_news_enabled, updated_at)
+		 VALUES ($1, $2, NOW())
+		 ON CONFLICT (chat_id) DO UPDATE SET global_news_enabled = $2, updated_at = NOW()`,
+		chatID, enabled,
+	)
+	return err
+}
+
+// AddGlobalArticles stores new shared global articles, deduplicating by link.
+func (s *Store) AddGlobalArticles(articles []GlobalArticle) ([]GlobalArticle, error) {
+	if len(articles) == 0 {
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx, `SELECT link FROM global_articles WHERE link = ANY($1)`, collectGlobalLinks(articles))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var link string
+		if err := rows.Scan(&link); err != nil {
+			return nil, err
+		}
+		existing[link] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var added []GlobalArticle
+	for _, a := range articles {
+		if a.Link == "" || existing[a.Link] {
+			continue
+		}
+		existing[a.Link] = true
+		added = append(added, a)
+	}
+
+	if len(added) == 0 {
+		return nil, nil
+	}
+
+	batch := &pgx.Batch{}
+	for _, a := range added {
+		batch.Queue(
+			`INSERT INTO global_articles (link, title, source, topic, importance, summary, published, fetched_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 ON CONFLICT (link) DO NOTHING`,
+			a.Link, a.Title, a.Source, a.Topic, a.Importance, a.Summary, a.Published, a.FetchedAt,
+		)
+	}
+	br := s.pool.SendBatch(ctx, batch)
+	for range added {
+		if _, err := br.Exec(); err != nil {
+			log.Printf("AddGlobalArticles insert error: %v", err)
+		}
+	}
+	_ = br.Close()
+
+	return added, nil
+}
+
+// GetLatestGlobalArticles returns the latest shared global articles.
+func (s *Store) GetLatestGlobalArticles(limit int) []GlobalArticle {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT title, link, source, topic, importance, summary, published, fetched_at
+		 FROM global_articles
+		 ORDER BY published DESC
+		 LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		log.Printf("GetLatestGlobalArticles error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var result []GlobalArticle
+	for rows.Next() {
+		var a GlobalArticle
+		if err := rows.Scan(&a.Title, &a.Link, &a.Source, &a.Topic, &a.Importance, &a.Summary, &a.Published, &a.FetchedAt); err != nil {
+			log.Printf("GetLatestGlobalArticles scan error: %v", err)
+			return nil
+		}
+		result = append(result, a)
+	}
+	return result
+}
+
+// GetUnsentGlobalArticles returns major global articles not yet delivered to the user.
+func (s *Store) GetUnsentGlobalArticles(chatID int64, limit int) []GlobalArticle {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT ga.title, ga.link, ga.source, ga.topic, ga.importance, ga.summary, ga.published, ga.fetched_at
+		 FROM global_articles ga
+		 LEFT JOIN global_digest_state gds
+		   ON gds.article_link = ga.link AND gds.chat_id = $1
+		 WHERE gds.article_link IS NULL
+		   AND ga.importance = 'major'
+		 ORDER BY ga.published DESC
+		 LIMIT $2`,
+		chatID, limit,
+	)
+	if err != nil {
+		log.Printf("GetUnsentGlobalArticles error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var result []GlobalArticle
+	for rows.Next() {
+		var a GlobalArticle
+		if err := rows.Scan(&a.Title, &a.Link, &a.Source, &a.Topic, &a.Importance, &a.Summary, &a.Published, &a.FetchedAt); err != nil {
+			log.Printf("GetUnsentGlobalArticles scan error: %v", err)
+			return nil
+		}
+		result = append(result, a)
+	}
+	return result
+}
+
+// RecordGlobalDigestArticles marks global articles as delivered for a user.
+func (s *Store) RecordGlobalDigestArticles(chatID int64, articles []GlobalArticle) error {
+	ctx := context.Background()
+	for _, a := range articles {
+		if a.Link == "" {
+			continue
+		}
+		_, err := s.pool.Exec(ctx,
+			`INSERT INTO global_digest_state (chat_id, article_link, last_seen_at)
+			 VALUES ($1, $2, NOW())
+			 ON CONFLICT (chat_id, article_link) DO UPDATE SET last_seen_at = NOW()`,
+			chatID, a.Link,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PruneOldGlobalArticles removes shared global articles older than 7 days.
+func (s *Store) PruneOldGlobalArticles() error {
+	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+	_, err := s.pool.Exec(context.Background(),
+		`DELETE FROM global_articles WHERE published < $1`,
+		cutoff,
+	)
+	return err
+}
+
+func collectGlobalLinks(articles []GlobalArticle) []string {
+	result := make([]string, 0, len(articles))
+	for _, a := range articles {
+		if a.Link != "" {
+			result = append(result, a.Link)
+		}
+	}
+	return result
 }
 
 // IsInDND returns true if the current UTC time falls within the user's DND window.

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     dnd_start_utc          TIME,
     dnd_end_utc            TIME,
     timezone               TEXT,
+    global_news_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
     last_digest_sent_at    TIMESTAMPTZ,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -92,6 +93,30 @@ CREATE TABLE IF NOT EXISTS digest_article_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_digest_article_state_chat ON digest_article_state(chat_id, symbol);
+
+-- Shared global/macro news articles and per-user delivery state
+CREATE TABLE IF NOT EXISTS global_articles (
+    link       TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    source     TEXT,
+    topic      TEXT,
+    importance TEXT NOT NULL DEFAULT 'major',
+    summary    TEXT,
+    published  TIMESTAMPTZ NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_global_articles_published ON global_articles(published DESC);
+CREATE INDEX IF NOT EXISTS idx_global_articles_topic ON global_articles(topic, published DESC);
+
+CREATE TABLE IF NOT EXISTS global_digest_state (
+    chat_id      BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+    article_link TEXT NOT NULL REFERENCES global_articles(link) ON DELETE CASCADE,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (chat_id, article_link)
+);
+
+CREATE INDEX IF NOT EXISTS idx_global_digest_state_chat ON global_digest_state(chat_id, last_seen_at DESC);
 
 -- Daily /analyse usage limit (5 per user per day UTC)
 CREATE TABLE IF NOT EXISTS analyse_usage (

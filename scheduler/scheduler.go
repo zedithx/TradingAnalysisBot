@@ -10,6 +10,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 
+	"TradingNewsBot/analysis"
 	"TradingNewsBot/storage"
 	"TradingNewsBot/yahoo"
 )
@@ -44,6 +45,8 @@ var (
 // NewsSummariser can summarize headlines for a symbol.
 type NewsSummariser interface {
 	SummarizeHeadlines(symbol string, headlines []string) (string, error)
+	ClassifyGlobalHeadlineBatch(articles []yahoo.GlobalNewsArticle) (map[string]analysis.GlobalHeadlineAssessment, error)
+	SummarizeGlobalDigest(articles []storage.GlobalArticle) (string, error)
 }
 
 // NotifyFunc is a callback that sends an HTML message to a Telegram chat.
@@ -83,7 +86,14 @@ func (s *Scheduler) Start() error {
 		if err := s.store.PruneOldArticles(); err != nil {
 			log.Printf("Error pruning old articles: %v", err)
 		}
+		if err := s.store.PruneOldGlobalArticles(); err != nil {
+			log.Printf("Error pruning old global articles: %v", err)
+		}
 	}); err != nil {
+		return err
+	}
+
+	if _, err := s.cron.AddFunc("15 */2 * * *", s.fetchGlobalNews); err != nil {
 		return err
 	}
 
@@ -152,7 +162,7 @@ func (s *Scheduler) Stop() {
 }
 
 // RunJobForTest runs a named job synchronously. Used by tests only.
-// Valid names: "checkIntradayAlerts", "sendMorningSnapshot", "checkAfterHoursAlerts", "checkUserPriceAlerts".
+// Valid names: "checkIntradayAlerts", "sendMorningSnapshot", "checkAfterHoursAlerts", "checkUserPriceAlerts", "fetchGlobalNews".
 func (s *Scheduler) RunJobForTest(name string) {
 	switch name {
 	case "checkIntradayAlerts":
@@ -163,6 +173,8 @@ func (s *Scheduler) RunJobForTest(name string) {
 		s.checkAfterHoursAlerts()
 	case "checkUserPriceAlerts":
 		s.checkUserPriceAlerts()
+	case "fetchGlobalNews":
+		s.fetchGlobalNews()
 	default:
 		log.Printf("RunJobForTest: unknown job %q", name)
 	}
@@ -280,6 +292,99 @@ func (s *Scheduler) fetchAllNews() {
 	}
 
 	log.Printf("Background fetch: complete (%d total articles across %d symbols)", totalFetched, len(symbolUsers))
+}
+
+// fetchGlobalNews collects high-signal macro/global stories and sends them to opted-in users.
+func (s *Scheduler) fetchGlobalNews() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Global news fetch: PANIC recovered: %v", r)
+		}
+	}()
+
+	if s.summariser == nil {
+		log.Println("Global news fetch: summariser unavailable, skipping")
+		return
+	}
+
+	candidates, err := yahoo.FetchGlobalNews(24 * time.Hour)
+	if err != nil {
+		log.Printf("Global news fetch: %v", err)
+		return
+	}
+
+	filtered := yahoo.FilterGlobalNewsCandidates(candidates)
+	if len(filtered) == 0 {
+		log.Println("Global news fetch: no candidates after keyword filter")
+		return
+	}
+
+	classified, err := s.summariser.ClassifyGlobalHeadlineBatch(filtered)
+	if err != nil {
+		log.Printf("Global news classify: %v", err)
+		return
+	}
+
+	now := time.Now().UTC()
+	var toStore []storage.GlobalArticle
+	for _, article := range filtered {
+		assessment, ok := classified[article.Link]
+		if !ok || assessment.Importance != "major" {
+			continue
+		}
+		toStore = append(toStore, storage.GlobalArticle{
+			Title:      article.Title,
+			Link:       article.Link,
+			Source:     article.Source,
+			Topic:      article.Topic,
+			Importance: assessment.Importance,
+			Summary:    assessment.Summary,
+			Published:  article.Published,
+			FetchedAt:  now,
+		})
+	}
+
+	added, err := s.store.AddGlobalArticles(toStore)
+	if err != nil {
+		log.Printf("Global news store: %v", err)
+		return
+	}
+	if len(added) == 0 || s.notify == nil {
+		log.Printf("Global news fetch: stored %d major stories, nothing to send", len(toStore))
+		return
+	}
+
+	users := s.store.GetAllUsers()
+	sentCount := 0
+	for _, u := range users {
+		prefs, err := s.store.GetPreferences(u.ChatID)
+		if err != nil || prefs == nil || !prefs.GlobalNewsEnabled {
+			continue
+		}
+		eligible, _ := s.store.IsEligible(u.ChatID)
+		if !eligible {
+			continue
+		}
+		inDND, _ := s.store.IsInDND(u.ChatID, now)
+		if inDND {
+			continue
+		}
+
+		articles := s.store.GetUnsentGlobalArticles(u.ChatID, 6)
+		if len(articles) == 0 {
+			continue
+		}
+		msg := s.buildGlobalDigest(u.ChatID, articles)
+		if msg == "" {
+			continue
+		}
+		s.notify(u.ChatID, msg)
+		_ = s.store.RecordGlobalDigestArticles(u.ChatID, articles)
+		sentCount++
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	log.Printf("Global news fetch: stored %d major stories, sent %d digests", len(added), sentCount)
 }
 
 // sendEarningsReminders checks each user's watchlist for earnings reports tomorrow and sends reminders.
@@ -1086,6 +1191,43 @@ func (s *Scheduler) buildDigest(chatID int64, symbolArticles map[string][]storag
 
 	for _, r := range articlesToRecord {
 		_ = s.store.RecordDigestArticles(chatID, r.symbol, r.articles)
+	}
+
+	return sb.String()
+}
+
+func (s *Scheduler) buildGlobalDigest(chatID int64, articles []storage.GlobalArticle) string {
+	if len(articles) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<b>Global market news</b>\n")
+
+	if s.summariser != nil {
+		if summary, err := s.summariser.SummarizeGlobalDigest(articles); err == nil && summary != "" {
+			sb.WriteString("\n")
+			sb.WriteString(escapeHTML(summary))
+			sb.WriteString("\n")
+		}
+	}
+
+	for _, a := range articles {
+		metaParts := []string{}
+		if a.Topic != "" {
+			metaParts = append(metaParts, a.Topic)
+		}
+		if a.Source != "" {
+			metaParts = append(metaParts, a.Source)
+		}
+		metaParts = append(metaParts, a.Published.Format("Jan 02, 3:04 PM UTC"))
+
+		sb.WriteString("\n• ")
+		sb.WriteString(fmt.Sprintf("<a href=\"%s\">%s</a>", a.Link, escapeHTML(a.Title)))
+		if a.Summary != "" {
+			sb.WriteString(fmt.Sprintf("\n  %s", escapeHTML(a.Summary)))
+		}
+		sb.WriteString(fmt.Sprintf("\n  <i>%s</i>\n", escapeHTML(strings.Join(metaParts, " — "))))
 	}
 
 	return sb.String()
